@@ -212,9 +212,113 @@ pub fn parse_objects(src: &[u8]) -> Result<Vec<Zone>, String> {
     Ok(out)
 }
 
+/// WorldGen-only properties from objects.lua. Unlike `parse_objects`, this keeps
+/// Rocks and geometry, which IsoMetaGrid.registerWorldGenZone forwards to the biome generator.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorldGenZoneSpec {
+    pub name: String,
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    pub w: i32,
+    pub h: i32,
+    pub geometry: String,
+    pub points: Vec<i32>,
+    pub polyline_width: i32,
+    pub rocks: Option<bool>,
+}
+
+/// Parse special zones without losing the `properties.Rocks` override.
+/// Unsupported/malformed WorldGen geometry is rejected, not silently downgraded.
+pub fn parse_worldgen_zones(src: &[u8]) -> Result<Vec<WorldGenZoneSpec>, String> {
+    let mut p = P { b: src, i: 0 };
+    p.ws();
+    if p.ident() != "objects" { return Err("file does not start with `objects =`".into()); }
+    p.ws();
+    if p.b.get(p.i) != Some(&b'=') { return Err("missing objects assignment".into()); }
+    p.i += 1;
+    let Val::Table(arr, _) = p.value()? else { return Err("objects is not a table".into()); };
+    let mut out = Vec::new();
+    for v in arr {
+        if v.str("type") != Some("WorldGen") { continue; }
+        let number = |k: &str| -> Result<i32, String> {
+            let n = v.num(k).ok_or_else(|| format!("WorldGen zone missing {k}"))?;
+            if !n.is_finite() || n.fract() != 0.0 || n < i32::MIN as f64 || n > i32::MAX as f64 {
+                return Err(format!("WorldGen zone invalid {k}: {n}"));
+            }
+            Ok(n as i32)
+        };
+        let geometry = v.str("geometry").unwrap_or("").to_string();
+        if !["", "point", "polyline", "polygon"].contains(&geometry.as_str()) {
+            return Err(format!("WorldGen unsupported geometry {geometry}"));
+        }
+        let points = match v.get("points") {
+            Some(Val::Table(a, _)) => a.iter().map(|x| {
+                let Val::Num(n) = x else { return Err("WorldGen point not numeric".to_string()); };
+                if !n.is_finite() || n.fract() != 0.0 || *n < i32::MIN as f64 || *n > i32::MAX as f64 {
+                    return Err("WorldGen point outside i32".to_string());
+                }
+                Ok(*n as i32)
+            }).collect::<Result<Vec<_>, _>>()?,
+            Some(_) => return Err("WorldGen points is not a list".into()),
+            None => Vec::new(),
+        };
+        if points.len() % 2 != 0 { return Err("WorldGen point pair truncated".into()); }
+        let rocks = match v.get("properties").and_then(|p| p.get("Rocks")) {
+            Some(Val::Bool(r)) => Some(*r),
+            Some(_) => return Err("WorldGen Rocks is not boolean".into()),
+            None => None,
+        };
+        // IsoMetaGrid.registerGeometryZone forwards a geometry's point list and the
+        // properties.LineWidth value, not the rectangle's `width` field.
+        let line_width = match v.get("properties").and_then(|p| p.num("LineWidth")) {
+            Some(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 && n <= 255.0 => n as i32,
+            Some(_) => return Err("WorldGen LineWidth must be an integer 0..255".into()),
+            None => 0,
+        };
+        let z = number("z")?;
+        let (x, y, w, h) = if geometry.is_empty() {
+            (number("x")?, number("y")?, number("width")?, number("height")?)
+        } else {
+            if points.len() < 2 { return Err("WorldGen geometry has no points".into()); }
+            let (min_x,max_x) = points.iter().step_by(2)
+                .fold((i32::MAX,i32::MIN), |(lo,hi),x| (lo.min(*x),hi.max(*x)));
+            let (min_y,max_y) = points.iter().skip(1).step_by(2)
+                .fold((i32::MAX,i32::MIN), |(lo,hi),y| (lo.min(*y),hi.max(*y)));
+            // Polygon/polylines are registered with their geometry bounds in the
+            // meta grid; an expanded bounding rectangle is safe for shape contains.
+            let pad = if geometry == "polyline" { (line_width + 1) / 2 } else { 0 };
+            let x = min_x.saturating_sub(pad);
+            let y = min_y.saturating_sub(pad);
+            let w = max_x.saturating_add(pad).saturating_sub(x).saturating_add(1);
+            let h = max_y.saturating_add(pad).saturating_sub(y).saturating_add(1);
+            (x,y,w,h)
+        };
+        if w < 0 || h < 0 { return Err("WorldGen zone has negative dimensions".into()); }
+        out.push(WorldGenZoneSpec {
+            name: v.str("name").unwrap_or("").to_string(),
+            x, y, z, w, h, geometry, points, polyline_width: line_width, rocks,
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worldgen_rocks_and_malformed_cases() {
+        let parsed = parse_worldgen_zones(br#"objects = {
+            { name="NoRocks", type="WorldGen", x=-16, y=3, z=0, width=8, height=8, properties={ Rocks=false } },
+            { name="Ordinary", type="TownZone", x=2 },
+            { name="Default", type="WorldGen", x=8, y=8, z=0, width=8, height=8 },
+        }"#).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].rocks, Some(false));
+        assert_eq!(parsed[0].x, -16);
+        assert_eq!(parsed[1].rocks, None);
+        assert!(parse_worldgen_zones(br#"objects={{type="WorldGen",x=0,y=0,z=0,width=8,height=8,properties={Rocks=5}}}"#).is_err());
+    }
     #[test]
     fn parses_rect_polygon_and_properties() {
         let z = parse_objects(br#"objects = {

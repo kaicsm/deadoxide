@@ -1090,6 +1090,21 @@ fn world_gen_generated_chunks_match_original_when_measured() {
 }
 
 #[test]
+fn wgsavereload_matches_original_when_measured() {
+    check_worldgen_when_measured("wgsavereload", &[]);
+}
+
+#[test]
 fn wgfullworld_matches_original_when_measured() {
     check_worldgen_when_measured("wgfullworld", &[]);
+}
+
+#[test]
+fn wgstreamwindow_matches_original_when_measured() {
+    check_worldgen_when_measured("wgstreamwindow", &[]);
+}
+
+#[test]
+fn wgspecialzones_matches_original_when_measured() {
+    check_worldgen_when_measured("wgspecialzones", &[]);
 }

@@ -1137,7 +1137,8 @@ impl IsoChunk {
                 let mut v = Vec::new();
                 for _ in 0..count {
                     // SquareCoord.load
-                    v.push((b.get_int()?, b.get_int()?, i32::from(b.get()?)));
+                    // WorldGen SquareCoord.save writes all three coordinates as int32.
+                    v.push((b.get_int()?, b.get_int()?, b.get_int()?));
                 }
                 c.attachments_partial = Some(v);
             }
@@ -1209,6 +1210,10 @@ impl IsoChunk {
             }
         }
         c.erosion = erosion_data::Chunk::load(&mut b)?;
+        // IsoChunk.getErosionData() owns this state after loading. Keep the
+        // runtime field in sync so a later save writes live erosion data.
+        ch.erosion = c.erosion.clone();
+        ch.erosion.set(wx, wy);
         let count = b.get_short()?;
         if count > 0 {
             let mut v = Vec::new();

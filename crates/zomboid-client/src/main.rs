@@ -1,5 +1,7 @@
 //! Zomboid-rs client. `zomboid-client <root> [cell] [--shot out.png [cx cy zoom w h]]`
 mod light;
+mod stream_gpu;
+use std::collections::BTreeMap;
 use scene::*;
 use sim::{Player, World, TICK_HZ};
 use std::sync::Arc;
@@ -12,6 +14,7 @@ use winit::{
     window::{Window, WindowId},
 };
 use zomboid_scene::{scene, sim};
+use zomboid_scene::async_stream::{AsyncWorldStreamer, Completion};
 
 /// Measured against the real game (tests/golden/spawn_rosewood): camera centre sits 56 px above the player feet at zoom 1. One sample only.
 const CAM_OVER_FEET: f32 = 56.0;
@@ -38,24 +41,218 @@ struct Gfx {
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
     bind: wgpu::BindGroup,
+    bind_layout: wgpu::BindGroupLayout,
+    atlas_sampler: wgpu::Sampler,
     cam_buf: wgpu::Buffer,
-    inst_buf: wgpu::Buffer,
+    bands: BTreeMap<(i32, i32), GpuInstanceBand>,
+    min_level: i32,
+    atlas_tex: wgpu::Texture,
     player_buf: wgpu::Buffer,
-    level_ranges: Vec<u32>,
     clear: [f64; 3],
 }
 
+struct GpuInstanceBand {
+    buffer: wgpu::Buffer,
+    capacity: usize,
+    count: u32,
+    /// CPU shadow: do not upload untouched bands after a new chunk is integrated.
+    bytes: Vec<u8>,
+}
+
 impl Gfx {
-    /// Replace the instance buffer after the scene was rebuilt (a door changed).
+    /// Replace the atlas for an initial snapshot or a non-append-only change.
+    fn set_atlas(&mut self, scene: &Scene) {
+        let a = &scene.atlas;
+        // Reuse the allocated texture and bind group if a repack retains its extent.
+        // This avoids an extra GPU allocation and pipeline rebind on such updates.
+        let extent = self.atlas_tex.size();
+        if extent.width == a.width && extent.height == a.height
+            && extent.depth_or_array_layers == a.layers {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.atlas_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &a.rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(a.width * 4),
+                    rows_per_image: Some(a.height),
+                },
+                extent,
+            );
+            return;
+        }
+        let tex = self.device.create_texture_with_data(
+            &self.queue,
+            &wgpu::TextureDescriptor {
+                label: Some("stream atlas"),
+                size: wgpu::Extent3d { width: a.width, height: a.height, depth_or_array_layers: a.layers },
+                mip_level_count: 1, sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor, &a.rgba,
+        );
+        let view = tex.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default()
+        });
+        self.bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("stream atlas bind"), layout: &self.bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.cam_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.atlas_sampler) },
+            ],
+        });
+        self.atlas_tex = tex;
+    }
+    /// Growing an append-only atlas must not re-upload its previously known
+    /// pixels from the CPU. Copy them on the GPU and upload only new rectangles.
+    /// Existing sprite placements remain stable in the streaming atlas.
+    fn grow_atlas_and_patch(&mut self, scene: &Scene) {
+        let old = self.atlas_tex.size();
+        let a = &scene.atlas;
+        if old.width == a.width && old.height == a.height
+            && old.depth_or_array_layers == a.layers
+        {
+            self.patch_atlas(scene);
+            return;
+        }
+        if a.width < old.width || a.height < old.height
+            || a.layers < old.depth_or_array_layers
+        {
+            // A shrinking/non-append-only atlas needs a complete replacement.
+            self.set_atlas(scene);
+            return;
+        }
+        let grown = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("grown stream atlas"),
+            size: wgpu::Extent3d {
+                width: a.width, height: a.height, depth_or_array_layers: a.layers,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("grow stream atlas copy"),
+        });
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.atlas_tex, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &grown, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
+            },
+            old,
+        );
+        self.queue.submit([encoder.finish()]);
+        let view = grown.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        self.bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("grown stream atlas bind"), layout: &self.bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.cam_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.atlas_sampler) },
+            ],
+        });
+        self.atlas_tex = grown;
+        self.patch_atlas(scene);
+    }
+
+    /// Upload only the new rectangles appended by the World Streamer.
+    fn patch_atlas(&mut self, scene: &Scene) {
+        for patch in &scene.gpu_atlas_patches {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.atlas_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: patch.x, y: patch.y, z: patch.layer },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &patch.rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(patch.width * 4),
+                    rows_per_image: Some(patch.height),
+                },
+                wgpu::Extent3d { width: patch.width, height: patch.height,
+                    depth_or_array_layers: 1 },
+            );
+        }
+    }
+
+    /// Keep the exact (z, y, x) painter order with separate GPU buffers for
+    /// eight-row bands. IsoChunkMap.doLoadGridsquare only changes local squares;
+    /// wgpu likewise need not receive the entire 9x9 window for every chunk.
     fn set_instances(&mut self, scene: &Scene) {
-        self.inst_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("inst"),
-                contents: bytemuck::cast_slice(&scene.instances),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        self.level_ranges = scene.level_ranges.clone();
+        let mut next = BTreeMap::new();
+        let mut uploaded = 0usize;
+        let mut unchanged = 0usize;
+        let item_size = std::mem::size_of::<Instance>();
+        for slice in stream_gpu::partition_bands(&scene.meta) {
+            let key = (slice.z, slice.y_band);
+            let bytes: &[u8] = bytemuck::cast_slice(&scene.instances[slice.start..slice.end]);
+            let count = (slice.end - slice.start) as u32;
+            let mut band = if let Some(band) = self.bands.remove(&key) {
+                band
+            } else {
+                let capacity = bytes.len().next_power_of_two().max(item_size);
+                GpuInstanceBand {
+                    buffer: self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("stream instance band"),
+                        size: capacity as u64,
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }),
+                    capacity,
+                    count: 0,
+                    bytes: Vec::new(),
+                }
+            };
+            if bytes.len() > band.capacity {
+                band.capacity = bytes.len().next_power_of_two();
+                band.buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("stream instance band grow"),
+                    size: band.capacity as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                band.bytes.clear();
+            }
+            if band.bytes.as_slice() != bytes {
+                // The insertion/removal of squares can shift following sprites
+                // within this band. Upload its new contiguous image, not all bands.
+                if !bytes.is_empty() {
+                    self.queue.write_buffer(&band.buffer, 0, bytes);
+                    uploaded += bytes.len();
+                }
+                band.bytes.clear();
+                band.bytes.extend_from_slice(bytes);
+            } else {
+                unchanged += 1;
+            }
+            band.count = count;
+            next.insert(key, band);
+        }
+        self.bands = next; // outgoing bands are freed with their buffers
+        self.min_level = scene.min_level;
+        log::trace!("World Streamer GPU instances: {} bands, {} unchanged, {} bytes uploaded",
+            self.bands.len(), unchanged, uploaded);
     }
     fn new(
         device: wgpu::Device,
@@ -77,7 +274,7 @@ impl Gfx {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             },
             wgpu::util::TextureDataOrder::LayerMajor,
@@ -97,11 +294,6 @@ impl Gfx {
             size: 32,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
-        let inst_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("inst"),
-            contents: bytemuck::cast_slice(&scene.instances),
-            usage: wgpu::BufferUsages::VERTEX,
         });
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
@@ -197,17 +389,22 @@ impl Gfx {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        Self {
+        let mut gfx = Self {
             device,
             queue,
             pipeline,
             bind,
+            bind_layout: bgl,
+            atlas_sampler: samp,
             cam_buf,
-            inst_buf,
+            bands: BTreeMap::new(),
+            min_level: scene.min_level,
+            atlas_tex: tex,
             player_buf,
-            level_ranges: scene.level_ranges.clone(),
             clear: scene.clear.map(|c| c as f64),
-        }
+        };
+        gfx.set_instances(scene);
+        gfx
     }
 
     fn draw(&self, view: &wgpu::TextureView, size: (u32, u32), cam: Camera, markers: &[Instance]) {
@@ -251,9 +448,14 @@ impl Gfx {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind, &[]);
-            pass.set_vertex_buffer(0, self.inst_buf.slice(..));
-            let top = (cam.max_level + 1).min(self.level_ranges.len() - 1);
-            pass.draw(0..4, 0..self.level_ranges[top]);
+            let max_z = self.min_level.saturating_add(cam.max_level as i32);
+            // BTreeMap iterates in (z, 8-row band) order, exactly preserving
+            // the original flat (z, y, x) painter order and alpha blending.
+            for (&(z, _), band) in &self.bands {
+                if z > max_z { break; }
+                pass.set_vertex_buffer(0, band.buffer.slice(..));
+                pass.draw(0..4, 0..band.count);
+            }
             if !markers.is_empty() {
                 pass.set_vertex_buffer(0, self.player_buf.slice(..));
                 pass.draw(0..4, 0..markers.len() as u32);
@@ -358,6 +560,7 @@ struct Live {
 
 struct App {
     scene: Scene,
+    async_stream: Option<AsyncWorldStreamer>,
     live: Option<Live>,
     cam: Camera,
     world: World,
@@ -434,7 +637,11 @@ impl ApplicationHandler for App {
                             }
                             KeyCode::KeyE if !event.repeat => {
                                 let p = self.world.player;
-                                if self.scene.toggle_door_near(p.x, p.y, p.z) {
+                                if let Some(worker) = &self.async_stream {
+                                    if let Err(e) = worker.toggle_door(p.x, p.y, p.z) {
+                                        log::error!("async door request: {e}");
+                                    }
+                                } else if self.scene.toggle_door_near(p.x, p.y, p.z) {
                                     if let Some(g) = self.live.as_mut().map(|l| &mut l.gfx) {
                                         g.set_instances(&self.scene);
                                     }
@@ -518,8 +725,22 @@ impl ApplicationHandler for App {
                             z: self.height.unwrap_or(p.z as f32),
                         };
                         let d = 4.0 / TICK_HZ;
-                        self.scene
-                            .move_character(&mut m, sx / len * d, sy / len * d);
+                        let (dx, dy) = (sx / len * d, sy / len * d);
+                        // The original IsoMovingObject.DoCollide cannot walk into
+                        // a null grid square. Keep that safety rule, but queue the
+                        // absent chunk ahead of an imminent movement/collision.
+                        if let Some((wx, wy)) = self.scene.stream_pending_move_chunk(&m, dx, dy) {
+                            if let Some(worker) = &mut self.async_stream {
+                                match worker.prioritize_chunk(wx, wy, (m.x, m.y)) {
+                                    Ok(true) => log::debug!(
+                                        "World Streamer collision waiting for chunk {wx},{wy} near {:.2},{:.2}",
+                                        m.x, m.y),
+                                    Ok(false) => {},
+                                    Err(e) => log::error!("stream movement priority: {e}"),
+                                }
+                            }
+                        }
+                        self.scene.move_character(&mut m, dx, dy);
                         self.height = Some(m.z);
                         let floor = m.z.floor() as i32;
                         if floor != p.z {
@@ -543,6 +764,87 @@ impl ApplicationHandler for App {
                         log::error!("Lua event dispatch failed: {error}");
                     }
                     self.acc -= 1.0 / TICK_HZ;
+                }
+                // IsoChunkMap.update: move the residency window when the player
+                // changes chunk. The window itself already includes surrounding
+                // chunks, so an extra hard-coded eight-tile lookahead is not Java's
+                // pedestrian loading policy.
+                if let Some(worker) = &mut self.async_stream {
+                    if let Err(e) = worker.request(self.world.player.x, self.world.player.y) {
+                        log::error!("stream request: {e}");
+                    }
+                }
+                // IsoChunkMap.updateInternal incorporates 1 + ready * 3 / width
+                // completed chunks, in FIFO order, not a constant two-chunk batch.
+                let completed = self.async_stream.as_mut()
+                    .map(AsyncWorldStreamer::poll).unwrap_or_default();
+                let mut atlas_dirty = false;
+                let mut instances_dirty = false;
+                let mut stream_failed = false;
+                for completion in completed {
+                    match completion {
+                        Completion::Prepared(snapshot) => {
+                            let commit_start = std::time::Instant::now();
+                            match self.scene.accept_stream_snapshot(snapshot) {
+                                Ok(report) => {
+                                    atlas_dirty |= report.atlas_changed;
+                                    instances_dirty = true;
+                                    log::debug!("World Streamer: +{} -{} disk {} teleport {} atlas {} commit {:.1}ms",
+                                        report.loaded, report.unloaded, report.restored_from_disk,
+                                        report.teleported, report.atlas_changed,
+                                        commit_start.elapsed().as_secs_f64() * 1000.0);
+                                }
+                                Err(e) => {
+                                    log::error!("stream merge: {e}; reverting to synchronous streaming");
+                                    stream_failed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        Completion::Failed(e) => {
+                            log::error!("async streaming failed: {e}; reverting to synchronous streaming");
+                            stream_failed = true;
+                            break;
+                        }
+                    }
+                }
+                if stream_failed { self.async_stream = None; }
+                let gpu_update_started = std::time::Instant::now();
+                if instances_dirty {
+                    // Upload once per render frame even when the Java consumption
+                    // quota incorporates several completed chunks.
+                    if atlas_dirty {
+                        if self.scene.gpu_atlas_full {
+                            if self.scene.gpu_atlas_patches.is_empty() {
+                                // Initial worker snapshot may contain a different
+                                // full atlas; copying the previous one is not safe.
+                                l.gfx.set_atlas(&self.scene);
+                            } else {
+                                l.gfx.grow_atlas_and_patch(&self.scene);
+                            }
+                        } else { l.gfx.patch_atlas(&self.scene); }
+                        self.scene.gpu_atlas_full = false;
+                        self.scene.gpu_atlas_patches.clear();
+                    }
+                    l.gfx.set_instances(&self.scene);
+                    let top = self.scene.level_ranges.len().saturating_sub(2);
+                    self.cam.max_level = ((self.world.player.z - self.scene.min_level).max(0) as usize).min(top);
+                }
+                let gpu_update_ms = gpu_update_started.elapsed().as_secs_f64() * 1000.0;
+                if gpu_update_ms > 16.0 {
+                    log::warn!("World Streamer render upload {:.1}ms (atlas_changed={}, instances_changed={})",
+                        gpu_update_ms, atlas_dirty, instances_dirty);
+                }
+                if self.async_stream.is_none() {
+                    // Explicit --no-async-stream, or a worker initialization error.
+                    match self.scene.stream_around(self.world.player.x, self.world.player.y) {
+                        Ok(Some(report)) => {
+                            if report.atlas_changed { l.gfx.set_atlas(&self.scene); }
+                            l.gfx.set_instances(&self.scene);
+                        }
+                        Ok(None) => {}
+                        Err(e) => log::error!("synchronous stream fallback: {e}"),
+                    }
                 }
                 {
                     let c = iso(
@@ -574,6 +876,11 @@ impl ApplicationHandler for App {
                     }
                     T::Outdated | T::Lost => l.surface.configure(&l.gfx.device, &l.config),
                     _ => {}
+                }
+                let frame_ms = now.elapsed().as_secs_f64() * 1000.0;
+                if frame_ms > 33.0 {
+                    log::warn!("World Streamer frame {:.1}ms (render upload {:.1}ms, player {:.2},{:.2})",
+                        frame_ms, gpu_update_ms, self.world.player.x, self.world.player.y);
                 }
                 l.window.request_redraw();
             }
@@ -662,7 +969,42 @@ fn main() -> anyhow::Result<()> {
             p.parent().unwrap_or(p).to_path_buf()
         }
     });
-    let mut scene = scene::load_region_from_save(&root, save_dir.as_deref(), x0, y0, x1, y1)?;
+    let persist_worldgen = a.iter().any(|s| s == "--persist-worldgen");
+    if persist_worldgen && save_dir.is_none() {
+        return Err(anyhow::anyhow!("--persist-worldgen requires --save <existing save folder>"));
+    }
+    // Stream by default in the interactive client. --shot keeps the old deterministic
+    // full-cell scene for screenshot oracles; --no-stream opts out for debugging.
+    let streaming = !a.iter().any(|s| s == "--shot" || s == "--no-stream");
+    let stream_radius: i32 = a.iter().position(|s| s == "--stream-radius")
+        .and_then(|i| a.get(i + 1)).map(|s| s.parse())
+        .transpose().map_err(|e| anyhow::anyhow!("--stream-radius: {e}"))?.unwrap_or(4);
+    let stream_player = a.iter().position(|s| s == "--player")
+        .and_then(|i| a.get(i + 1).zip(a.get(i + 2)))
+        .map(|(x, y)| Ok::<_, anyhow::Error>((x.parse::<f32>()?, y.parse::<f32>()?)))
+        .transpose()?
+        .or_else(|| saved.as_ref().map(|p| (p.x as f32, p.y as f32)))
+        .unwrap_or(((x0 * 256 + 116) as f32, (y0 * 256 + 116) as f32));
+    // Java creates its World Streamer before the player begins moving. Start
+    // the isolated Rust loading context while the foreground's initial region
+    // is being prepared, instead of making the first walk wait for another
+    // entire synchronous world initialization after the window appears.
+    let mut async_stream = if streaming && !persist_worldgen
+        && !a.iter().any(|s| s == "--no-async-stream" || s == "--headless-ticks") {
+        Some(AsyncWorldStreamer::spawn(
+            root.clone(), save_dir.clone(), stream_player, stream_radius,
+            persist_worldgen,
+        ).map_err(anyhow::Error::msg)?)
+    } else { None };
+    let mut scene = if streaming {
+        scene::load_streaming(&root, save_dir.as_deref(), stream_player.0, stream_player.1,
+            stream_radius, persist_worldgen)?
+    } else if persist_worldgen {
+        scene::load_region_from_save_persist(&root, save_dir.as_deref()
+            .ok_or_else(|| anyhow::anyhow!("missing --save directory"))?, x0, y0, x1, y1)?
+    } else {
+        scene::load_region_from_save(&root, save_dir.as_deref(), x0, y0, x1, y1)?
+    };
     if let Some(st) = &scene.state {
         if save_dir.is_some() {
             println!(
@@ -681,7 +1023,9 @@ fn main() -> anyhow::Result<()> {
         t0.elapsed().as_secs_f32()
     );
     let top = scene.level_ranges.len() - 2;
-    let (gx, gy) = ((x0 * 256 + 116) as f32, (y0 * 256 + 116) as f32);
+    let (gx, gy) = if streaming { stream_player } else {
+        ((x0 * 256 + 116) as f32, (y0 * 256 + 116) as f32)
+    };
     let mut cam = Camera {
         center: [(gx - gy) * 64.0, (gx + gy) * 32.0],
         zoom: 0.5,
@@ -769,7 +1113,9 @@ fn main() -> anyhow::Result<()> {
             a.get(i + 1).map(String::as_str).unwrap_or("shot.png"),
         );
     }
-    let player = match &saved {
+    let player = if streaming && a.iter().any(|v| v == "--player") {
+        Player { x: gx, y: gy, z: saved.as_ref().map_or(0, |p| p.z) }
+    } else { match &saved {
         Some(p) => {
             println!(
                 "save: {} at ({:.1}, {:.1}) z{}{}",
@@ -786,7 +1132,12 @@ fn main() -> anyhow::Result<()> {
             }
         }
         None => spawn(&scene, gx, gy),
-    };
+    }};
+    if streaming {
+        let position = iso(player.x, player.y, player.z);
+        cam.center = [position[0], position[1] - CAM_OVER_FEET];
+        cam.max_level = (player.z - scene.min_level).clamp(0, top as i32) as usize;
+    }
     let mut world = World::new(1, player, &scene.collision, 40, 20);
     if let (Some(time), Some(day)) = (&saved_time, &saved_day) {
         world.clock = sim::GameClock::from_save(time, day);
@@ -918,10 +1269,19 @@ fn main() -> anyhow::Result<()> {
         world.zombies.len(),
         TICK_HZ
     );
+    // When persisting new chunks, finish the foreground's initial save writes
+    // before starting the second loader. Two writers must never race on map/*.bin.
+    if streaming && persist_worldgen && !a.iter().any(|s| s == "--no-async-stream") {
+        async_stream = Some(AsyncWorldStreamer::spawn(
+            root.clone(), save_dir.clone(), stream_player, stream_radius,
+            persist_worldgen,
+        ).map_err(anyhow::Error::msg)?);
+    }
     let el = EventLoop::new()?;
     el.set_control_flow(ControlFlow::Poll);
     el.run_app(&mut App {
         scene,
+        async_stream,
         live: None,
         cam,
         world,

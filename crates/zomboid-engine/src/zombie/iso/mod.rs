@@ -5,6 +5,7 @@ pub mod building_def;
 pub mod building_id;
 pub mod cell_loader;
 pub mod chunk_save;
+pub mod chunk_save_writer;
 pub mod container_overlays;
 pub mod instance_tracker;
 pub mod iso_cell;
@@ -37,3 +38,5 @@ pub mod weather;
 pub mod world_version;
 pub mod worldgen;
 pub mod zones;
+
+pub mod streaming_window;

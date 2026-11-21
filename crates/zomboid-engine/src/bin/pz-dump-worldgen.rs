@@ -1250,3 +1250,198 @@ fn fullworld_dump(
     }
     Ok(())
 }
+
+/// IsoChunk.Save(v249) -> IsoChunk.LoadFromDiskOrBuffer on an 8x8 chunk.
+/// The full native byte stream is compared against the original Java server.
+pub fn savereload(root: &Path) -> Result<String, String> {
+    use std::collections::{BTreeMap, HashMap};
+    use zomboid_engine::java;
+    use zomboid_engine::zombie::core::random::rand_abstract::RandAbstract;
+    use zomboid_engine::zombie::iso::chunk_save::{ChunkSave, SaveLoadContext};
+    use zomboid_engine::zombie::iso::iso_chunk::IsoChunk;
+    use zomboid_engine::zombie::iso::iso_grid_square::IsoGridSquare;
+    use zomboid_engine::zombie::iso::iso_meta_grid::AlarmSettings;
+    use zomboid_engine::zombie::iso::iso_object::{IsoObject, ObjectKind};
+    use zomboid_engine::zombie::iso::iso_world::IsoWorld;
+    use zomboid_engine::zombie::inventory::inventory_item::{ItemFactory, ItemTemplate};
+    use zomboid_engine::zombie::world::dictionary_data::DictionaryData;
+
+    struct NoItems;
+    impl ItemFactory for NoItems {
+        fn create_item(&self, _: i16) -> Option<ItemTemplate> { None }
+        fn is_obsolete(&self, _: &str) -> bool { false }
+        fn media_data_from_index(&self, _: i16) -> Option<String> { None }
+    }
+    const X: i32 = 1034;
+    const Y: i32 = 1458;
+    let mut rng = RandAbstract::new(java::Random::new(12345));
+    let alarm = AlarmSettings { last_stand: false, power_grid_exists: true, alarm: 1, alarm_decay: 1 };
+    let mut world = IsoWorld::init(root, "Muldraugh, KY", &|_| false, &alarm, None, &mut rng)
+        .map_err(|e| format!("IsoWorld.init: {e}"))?;
+    let ground = world.sprites.get_sprite("blends_natural_01_0");
+    let plant = world.sprites.get_sprite("vegetation_groundcover_01_0");
+    let mut ch = IsoChunk::new(X, Y);
+    ch.set_min_max_level(0, 0);
+    for x in 0..8 {
+        for y in 0..8 {
+            let mut sq = IsoGridSquare::new(X * 8 + x, Y * 8 + y, 0);
+            let mut floor = IsoObject::new(ObjectKind::IsoObject, Some(ground));
+            if x == 0 && y == 0 { floor.name = Some("Grass".into()); }
+            sq.objects.push(floor);
+            if x == 0 && y == 0 { sq.objects.push(IsoObject::new(ObjectKind::IsoObject, Some(plant))); }
+            if x == 1 && y == 0 {
+                sq.objects.push(IsoObject::new(ObjectKind::IsoObject, Some(plant)));
+                sq.objects.push(IsoObject::new(ObjectKind::IsoObject, Some(plant)));
+            }
+            ch.set_square(x, y, 0, Some(sq));
+        }
+    }
+    ch.set_loaded();
+    ch.save = Some(Box::new(ChunkSave {
+        blending_done_partial: true,
+        blending_modified: [true, false, true, false],
+        blending_depth: [4, 0, 3, 0],
+        attachments_done_full: false,
+        attachments_state: [true, true, false, true, true],
+        attachments_partial: Some(vec![(X * 8 + 1, Y * 8 + 2, 0)]),
+        ..ChunkSave::default()
+    }));
+    let mut out = String::new();
+    savereload_dump(&mut out, "BEFORE", &ch, &world.sprites)?;
+    let original = ch.save_to_buffer(&world.sprites, None)?;
+    let _ = writeln!(out, "BYTES {} CRC {}", original.len(), java::crc32(&original[17..]));
+    out.push_str("HEX ");
+    for b in &original { let _ = write!(out, "{b:02x}"); }
+    out.push('\n');
+    let dictionary = DictionaryData {
+        version: 0, next_info_id: 0, next_object_name_id: 0, next_sprite_name_id: 0,
+        mod_ids: Vec::new(), modules: Vec::new(), items: BTreeMap::new(),
+        item_types: HashMap::new(), entities: BTreeMap::new(), entity_types: HashMap::new(),
+        object_names: BTreeMap::new(), object_ids: HashMap::new(),
+        sprite_names: BTreeMap::new(), sprite_ids: HashMap::new(),
+        string_registers: Vec::new(), script_registers: Vec::new(),
+    };
+    // Persist the same native bytes to the real map/<wx>/<wy>.bin layout.
+    // The temporary directory is independent of any existing Project Zomboid save.
+    let temp = std::env::temp_dir().join(format!("deadoxide-wgsavereload-{}", std::process::id()));
+    std::fs::create_dir(&temp).map_err(|e| format!("{}: {e}", temp.display()))?;
+    let result = (|| -> Result<(), String> {
+        IsoChunk::save_bytes_to_disk(&temp, X, Y, &original)?;
+        let path = temp.join("map").join(X.to_string()).join(format!("{Y}.bin"));
+        let on_disk = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let _ = writeln!(out, "DISK_EQUALS {}", original == on_disk);
+        let mut ctx = SaveLoadContext {
+            sprites: &mut world.sprites, alias: &world.alias,
+            dictionary: &dictionary, items: &NoItems, meta_grid: &mut world.meta_grid,
+            rand: &mut rng, has_lot_header: true,
+        };
+        let reloaded = IsoChunk::load_from_disk_or_buffer(&on_disk, X, Y, &mut ctx)?;
+        drop(ctx);
+        savereload_dump(&mut out, "RELOADED", &reloaded, &world.sprites)?;
+        let again = reloaded.save_to_buffer(&world.sprites, None)?;
+        let _ = writeln!(out, "RESAVE_EQUALS {}", original == again);
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&temp);
+    result?;
+    Ok(out)
+}
+
+fn savereload_dump(
+    out: &mut String, stage: &str,
+    ch: &zomboid_engine::zombie::iso::iso_chunk::IsoChunk,
+    sprites: &IsoSpriteManager,
+) -> Result<(), String> {
+    let s = ch.save.as_deref().ok_or("missing save header")?;
+    let bit = |b: bool| i32::from(b);
+    let partial = s.attachments_partial.as_ref().map_or("null".to_owned(), |v| v.len().to_string());
+    let _ = writeln!(out,
+        "{stage} {} {} LEVELS {} {} BLEND {} {} {} {} {} {} ATTACH {} {} {} {} {} {} PARTIAL {}",
+        ch.wx, ch.wy, ch.get_min_level(), ch.get_max_level(),
+        bit(s.blending_done_full), bit(s.blending_done_partial),
+        bit(s.blending_modified[0]), bit(s.blending_modified[1]),
+        bit(s.blending_modified[2]), bit(s.blending_modified[3]),
+        bit(s.attachments_done_full), bit(s.attachments_state[0]), bit(s.attachments_state[1]),
+        bit(s.attachments_state[2]), bit(s.attachments_state[3]), bit(s.attachments_state[4]),
+        partial,
+    );
+    for x in 0..8 {
+        for y in 0..8 {
+            if let Some(sq) = ch.get_grid_square(x, y, 0) {
+                let _ = write!(out, "S {x} {y}");
+                for obj in &sq.objects {
+                    let name = obj.sprite.and_then(|v| sprites.sprite(v).name.as_deref()).unwrap_or("null");
+                    let _ = write!(out, " | {} {name}", obj.kind.class_name());
+                    if let Some(attachments) = &obj.attached_anim_sprite {
+                        for sprite in attachments {
+                            let name = sprites.sprite(*sprite).name.as_deref().unwrap_or("null");
+                            let _ = write!(out, " + {name}");
+                        }
+                    }
+                }
+                out.push('\n');
+            } else {
+                let _ = writeln!(out, "S {x} {y} null");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// IsoChunkMap.update / window-scroll scheduling compared with WgStreamWindowProbe.java.
+/// The Java probe also verifies the real IsoChunkMap.setInitialPos/getWorldXMin origin.
+pub fn streamwindow() -> Result<String, String> {
+    use zomboid_engine::zombie::iso::streaming_window::ChunkWindow;
+    let positions = [
+        (255.2f32, 255.8f32), (256.1,255.8), (256.2,256.2), (256.2,256.2),
+        (-0.01,-8.01), (-0.01,-8.01), (255.2,255.8),
+    ];
+    let mut out = String::new();
+    let mut previous: Option<ChunkWindow> = None;
+    for (i, (x, y)) in positions.into_iter().enumerate() {
+        let win = ChunkWindow::for_player(x, y, 4)?;
+        let (x0,y0,x1,y1) = win.cells();
+        writeln!(out, "WINDOW {i} {} {} CELLS {x0} {y0} {x1} {y1}", win.cx, win.cy)
+            .map_err(|e| e.to_string())?;
+        if let Some(old) = previous {
+            let d = old.diff(win);
+            writeln!(out, "DIFF {} {} {}", d.load.len(), d.unload.len(), i32::from(d.teleport))
+                .map_err(|e| e.to_string())?;
+            for (cx,cy) in d.load { writeln!(out, "+ {cx} {cy}").map_err(|e| e.to_string())?; }
+            let mut sorted = d.unload;
+            sorted.sort_unstable();
+            for (cx,cy) in sorted { writeln!(out, "- {cx} {cy}").map_err(|e| e.to_string())?; }
+        }
+        previous = Some(win);
+    }
+    Ok(out)
+}
+
+/// WorldGenZone(Rocks), Zone.contains across boundaries, negative coordinates and polygons.
+pub fn specialzones() -> Result<String, String> {
+    use zomboid_engine::zombie::iso::worldgen::zones::world_gen_zone::WorldGenZone;
+    use zomboid_engine::zombie::iso::zones::zone::Zone;
+    use zomboid_engine::zombie::iso::zones::zone_geometry_type::ZoneGeometryType;
+    let mut zones = vec![
+        WorldGenZone::new(Zone::new("default", "WorldGen", -16, -16, 0, 8, 8), None),
+        WorldGenZone::new(Zone::new("off", "WorldGen", -4, 6, 0, 8, 8), Some(false)),
+        WorldGenZone::new(Zone::new("on", "WorldGen", -4, 6, 1, 8, 8), Some(true)),
+        WorldGenZone::new(Zone::new("polygon", "WorldGen", 10, 10, 0, 8, 8), Some(false)),
+    ];
+    zones[3].zone.geometry_type = ZoneGeometryType::Polygon;
+    zones[3].zone.points = vec![10,10,17,10,17,17,10,17];
+    let mut out = String::new();
+    for (i,z) in zones.iter_mut().enumerate() {
+        writeln!(out, "ZONE {i} rocks={}", i32::from(z.get_rocks())).map_err(|e| e.to_string())?;
+        for x in [-17,-16,-15,-9,-8,-5,-4,-1,0,3,4,9,10,11,15,17,18] {
+            for y in [-17,-16,-9,-8,5,6,7,13,14,17,18] {
+                for level in [0,1] {
+                    if z.contains(x,y,level) {
+                        writeln!(out, "HIT {i} {x} {y} {level}").map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}

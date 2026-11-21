@@ -152,6 +152,9 @@ fn main() {
         Some("wgattachments") if a.len() == 3 => worldgen_dump::attachments(Path::new(&a[2])),
         Some("wgprefabs") if a.len() == 3 => worldgen_dump::prefabs(Path::new(&a[2])),
         Some("wgfullworld") if a.len() == 3 => worldgen_dump::fullworld(Path::new(&a[2])),
+        Some("wgsavereload") if a.len() == 3 => worldgen_dump::savereload(Path::new(&a[2])),
+        Some("wgstreamwindow") if a.len() == 3 => worldgen_dump::streamwindow(),
+        Some("wgspecialzones") if a.len() == 3 => worldgen_dump::specialzones(), 
         Some("wggenerate") if a.len() == 3 => worldgen_dump::generate(Path::new(&a[2])),
         Some("luaload" | "luaserver" | "luaclient") if a.len() >= 4 => {
             luaload(Path::new(&a[2]), &a[3], &a[4..], false)

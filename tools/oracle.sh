@@ -356,6 +356,12 @@ sel wgattachments && server_case wgattachments WgAttachmentsProbe
 sel wgprefabs && server_case wgprefabs WgPrefabsProbe
 # Real lotpack-backed LoadBrandNew (2x2 per request) + 3x3 loaded chunk update.
 sel wgfullworld && server_case wgfullworld WgFullWorldProbe
+# Native world v249 chunk bytes + IsoChunk.LoadFromDiskOrBuffer round trip.
+sel wgsavereload && server_case wgsavereload WgSaveReloadProbe
+# IsoChunkMap resident-window scheduling: one-step scroll, reverse, teleport, negative coords.
+sel wgstreamwindow && server_case wgstreamwindow WgStreamWindowProbe
+# WorldGen zone Rocks, polygon and boundary semantics, including negative coordinates.
+sel wgspecialzones && server_case wgspecialzones WgSpecialZonesProbe
 # WorldGenChunk.generateChunks: a controlled empty 2x2 cache (one pre-existing object) on the
 # booted original server, compared against the port using the same Lua tables and tile definitions.
 sel wggenerate && server_case wggenerate WgGenerateProbe

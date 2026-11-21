@@ -19,7 +19,7 @@ pub const WINDOW_N: u16 = 128;
 pub const WINDOW_W: u16 = 256;
 pub const HOPPABLE: u16 = 512;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Collision {
     flags: HashMap<(i32, i32, i32), u16>,
     /// zombie.iso.IsoGridSquare.collideMatrix of every loaded square, computed by the ported engine
@@ -33,6 +33,23 @@ pub struct Collision {
 impl Collision {
     pub fn add(&mut self, x: i32, y: i32, z: i32, f: u16) {
         *self.flags.entry((x, y, z)).or_default() |= f;
+    }
+    /// Remove only completed chunks whose grid-square collision has changed.
+    /// IsoChunkMap.updateInternal updates the affected squares; it never clears
+    /// collision state for the entire resident window on every load.
+    pub fn erase_chunks(&mut self, chunks: &std::collections::HashSet<(i32, i32)>) {
+        let retained = |&(x, y, _): &(i32, i32, i32)| {
+            !chunks.contains(&(x.div_euclid(8), y.div_euclid(8)))
+        };
+        self.flags.retain(|key, _| retained(key));
+        self.collide_matrix.retain(|key, _| retained(key));
+        self.special.retain(|key, _| retained(key));
+    }
+
+    pub fn extend_from(&mut self, other: &Collision) {
+        self.flags.extend(other.flags.iter().map(|(key, value)| (*key, *value)));
+        self.collide_matrix.extend(other.collide_matrix.iter().map(|(key, value)| (*key, *value)));
+        self.special.extend(other.special.iter().map(|(key, value)| (*key, *value)));
     }
     /// Store the original-equivalent collide matrix of a square (bit `x + y*3 + z*9`, offsets + 1, set = blocked).
     pub fn set_collide_matrix(&mut self, x: i32, y: i32, z: i32, matrix: i32) {

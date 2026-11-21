@@ -14,6 +14,7 @@ use crate::zombie::core::tile_property_alias_map::TilePropertyAliasMap;
 use crate::zombie::game_window::ClientStartup;
 use crate::zombie::iso::cell_loader::{self, LoadContext};
 use crate::zombie::iso::iso_chunk::IsoChunk;
+use crate::zombie::iso::chunk_save::ChunkSave;
 use crate::zombie::iso::sprite::iso_sprite_manager::IsoSpriteManager;
 use crate::zombie::lua::exposed_game;
 use crate::zombie::lua::lua_manager::LuaManager;
@@ -139,6 +140,32 @@ impl WorldGenRuntime {
         sprites: &mut IsoSpriteManager,
         alias: &TilePropertyAliasMap,
     ) -> Result<(), String> {
+        self.postprocess_selected(chunks, sprites, alias, None)
+    }
+
+    /// IsoChunkMap.updateInternal: when a new chunk is integrated, only its own
+    /// WorldGen handshakes and those of the adjacent chunks can become newly
+    /// satisfiable. Unrelated chunks retain the completion flags from prior updates.
+    /// The 3x3 expansion is also required for attachments, which wait for all
+    /// neighbours. The full-region method above is retained for initial loading.
+    pub fn postprocess_near(
+        &mut self,
+        chunks: &mut [IsoChunk],
+        sprites: &mut IsoSpriteManager,
+        alias: &TilePropertyAliasMap,
+        touched: &std::collections::HashSet<(i32, i32)>,
+    ) -> Result<(), String> {
+        if touched.is_empty() { return Ok(()); }
+        self.postprocess_selected(chunks, sprites, alias, Some(touched))
+    }
+
+    fn postprocess_selected(
+        &mut self,
+        chunks: &mut [IsoChunk],
+        sprites: &mut IsoSpriteManager,
+        alias: &TilePropertyAliasMap,
+        touched: Option<&std::collections::HashSet<(i32, i32)>>,
+    ) -> Result<(), String> {
         let keys: Vec<_> = chunks.iter()
             .map(|ch| ChunkCoord::new(ch.wx, ch.wy)).collect();
         let mut unique = std::collections::HashSet::new();
@@ -153,22 +180,30 @@ impl WorldGenRuntime {
             cache.put(key, std::mem::take(chunk));
         }
         let mut failure = None;
-        for key in &keys {
-            if !cache.get(*key).is_some_and(|chunk| chunk.loaded) { continue; }
+        // IsoChunkMap.updateInternal visits the grid in (y, x) order. The
+        // initial full-region path retains its original iteration order for
+        // already validated oracles; incremental updates use the live grid order.
+        let mut targets: Vec<_> = keys.iter().copied().filter(|key| {
+            touched.is_none_or(|changed| changed.iter().any(|&(x, y)| {
+                (key.x - x).abs() <= 1 && (key.y - y).abs() <= 1
+            }))
+        }).collect();
+        if touched.is_some() { targets.sort_by_key(|key| (key.y, key.x)); }
+        for key in targets {
+            if !cache.get(key).is_some_and(|chunk| chunk.loaded) { continue; }
             if let Err(e) = self.generator.update_worldgen_chunk(
-                &mut cache, *key, &self.blending, &self.attachments, sprites, alias,
+                &mut cache, key, &self.blending, &self.attachments, sprites, alias,
             ) {
                 failure = Some(format!("WorldGen chunk {},{}: {e}", key.x, key.y));
                 break;
             }
         }
-        // Update the in-memory save header as well. Persisting a modified chunk to disk is
-        // the responsibility of the (not yet wired) chunk-save writer.
+        // IsoChunk.Save reads these handshake flags from the chunk itself. Mirror the
+        // generated and previously loaded chunks into their native save headers.
         for (slot, key) in chunks.iter_mut().zip(keys) {
             if let Some(mut chunk) = cache.remove(key) {
-                if let (Some(save), Some(state)) = (
-                    chunk.save.as_mut(), self.generator.chunk_states.get(&(key.x, key.y)),
-                ) {
+                if let Some(state) = self.generator.chunk_states.get(&(key.x, key.y)) {
+                    let save = chunk.save.get_or_insert_with(|| Box::new(ChunkSave::default()));
                     save.blending_done_full = state.blending_done_full;
                     save.blending_done_partial = state.blending_done_partial;
                     save.blending_modified = state.blending_modified;
