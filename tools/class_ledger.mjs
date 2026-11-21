@@ -5,8 +5,9 @@
 //   node tools/class_ledger.mjs
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-const repo = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..");
+const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const dec = path.join(repo, "decompiled");
 if (!fs.existsSync(dec)) throw new Error("no ./decompiled; run sh tools/decompile.sh");
 

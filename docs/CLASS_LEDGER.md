@@ -4,17 +4,17 @@ Source: decompiled `projectzomboid.jar` sha256 `e1a69eb743ede60b213a0fe7f8b83d4f
 A method counts as cited when a Rust doc comment names it. Citing is a pointer for reviewers, not proof of parity: evidence lives in docs/COMPATIBILITY.md.
 Method counts are distinct method names per top-level file (overloads and inner classes merged).
 
-**Total: 506 of 3432 classes touched, 2064 of 46318 method names cited (4.5%), 965313 decompiled lines.**
+**Total: 560 of 3432 classes touched, 2140 of 46318 method names cited (4.6%), 965313 decompiled lines.**
 
 | Package | Classes | Touched | Method names | Cited | Lines |
 |---|---:|---:|---:|---:|---:|
 | generation | 145 | 0 | 2113 | 0 (0.0%) | 193849 |
-| zombie.iso | 346 | 80 | 7277 | 454 (6.2%) | 144530 |
+| zombie.iso | 346 | 133 | 7277 | 526 (7.2%) | 144530 |
 | zombie.core | 450 | 96 | 5920 | 231 (3.9%) | 93574 |
 | zombie.characters | 200 | 51 | 5028 | 195 (3.9%) | 77144 |
 | zombie.network | 436 | 4 | 3229 | 4 (0.1%) | 60679 |
 | zombie.scripting | 205 | 37 | 2713 | 177 (6.5%) | 52509 |
-| zombie.entity | 156 | 10 | 2517 | 14 (0.6%) | 36294 |
+| zombie.entity | 156 | 11 | 2517 | 18 (0.7%) | 36294 |
 | zombie.inventory | 40 | 17 | 2100 | 25 (1.2%) | 28391 |
 | zombie.vehicles | 42 | 13 | 1411 | 14 (1.0%) | 28275 |
 | zombie | 60 | 14 | 1192 | 113 (9.5%) | 22185 |
@@ -316,6 +316,7 @@ Method counts are distinct method names per top-level file (overloads and inner 
 | zombie.entity.components.crafting.recipe.OverlayMapper | 4 / 7 | crates/zomboid-engine/src/zombie/entity/components/crafting/recipe/overlay_mapper.rs |
 | zombie.entity.components.resources.ResourceType | 0 / 3 | crates/zomboid-engine/src/zombie/entity/components/resources/resource_type.rs |
 | zombie.entity.components.spriteconfig.SpriteConfigManager | 2 / 56 | crates/zomboid-engine/src/zombie/scripting/sprite_config.rs |
+| zombie.entity.util.LongMap | 4 / 34 | crates/zomboid-engine/src/zombie/iso/worldgen/veins/long_map.rs |
 | zombie.erosion.ErosionConfig | 1 / 9 | crates/zomboid-engine/src/zombie/erosion/erosion_config.rs |
 | zombie.erosion.ErosionData | 0 / 5 | crates/zomboid-engine/src/zombie/erosion/erosion_data.rs |
 | zombie.erosion.ErosionGlobals | 1 / 2 | crates/zomboid-engine/src/bin/pz-dump.rs |
@@ -440,8 +441,61 @@ Method counts are distinct method names per top-level file (overloads and inner 
 | zombie.iso.weather.Temperature | 4 / 14 | crates/zomboid-engine/src/zombie/characters/body_damage/body_sim.rs, crates/zomboid-engine/src/zombie/iso/weather/temperature.rs |
 | zombie.iso.weather.ThunderStorm | 8 / 30 | crates/zomboid-engine/src/zombie/iso/weather/thunder_storm.rs |
 | zombie.iso.weather.WeatherPeriod | 22 / 87 | crates/zomboid-engine/src/zombie/iso/weather/weather_period.rs |
-| zombie.iso.worldgen.WorldGenParams | 3 / 15 | crates/zomboid-engine/src/zombie/iso/worldgen/world_gen_params.rs, crates/zomboid-scene/src/scene.rs |
+| zombie.iso.worldgen.ChunksCache | 0 / 10 | crates/zomboid-engine/src/zombie/iso/worldgen/chunks_cache.rs |
+| zombie.iso.worldgen.PrefabStructure | 0 / 9 | crates/zomboid-engine/src/zombie/iso/worldgen/prefab_structure.rs |
+| zombie.iso.worldgen.StaticModule | 0 / 0 | crates/zomboid-engine/src/zombie/iso/worldgen/static_module.rs |
+| zombie.iso.worldgen.WorldGenChunk | 0 / 16 | crates/zomboid-engine/src/zombie/iso/worldgen/world_gen_chunk.rs |
+| zombie.iso.worldgen.WorldGenParams | 4 / 15 | crates/zomboid-engine/src/zombie/iso/worldgen/world_gen_params.rs, crates/zomboid-scene/src/scene.rs |
+| zombie.iso.worldgen.WorldGenReader | 0 / 22 | crates/zomboid-engine/src/zombie/iso/worldgen/world_gen_reader.rs |
+| zombie.iso.worldgen.WorldGenSimplexGenerator | 3 / 4 | crates/zomboid-engine/src/zombie/iso/weather/simplex_noise.rs, crates/zomboid-engine/src/zombie/iso/worldgen/world_gen_simplex_generator.rs |
+| zombie.iso.worldgen.WorldGenTile | 0 / 9 | crates/zomboid-engine/src/zombie/iso/worldgen/world_gen_tile.rs |
 | zombie.iso.worldgen.WorldGenUtils | 3 / 16 | crates/zomboid-engine/src/zombie/iso/worldgen/world_gen_utils.rs |
+| zombie.iso.worldgen.biomes.Biome | 0 / 7 | crates/zomboid-engine/src/zombie/iso/worldgen/biomes/biome.rs |
+| zombie.iso.worldgen.biomes.BiomeNoise | 0 / 0 | crates/zomboid-engine/src/zombie/iso/worldgen/biomes/biome_noise.rs |
+| zombie.iso.worldgen.biomes.BiomeRegistry | 0 / 9 | crates/zomboid-engine/src/zombie/iso/worldgen/biomes/biome_registry.rs |
+| zombie.iso.worldgen.biomes.BiomeType | 0 / 0 | crates/zomboid-engine/src/zombie/iso/worldgen/biomes/biome_type.rs |
+| zombie.iso.worldgen.biomes.Feature | 0 / 0 | crates/zomboid-engine/src/zombie/iso/worldgen/biomes/feature.rs |
+| zombie.iso.worldgen.biomes.FeatureType | 0 / 0 | crates/zomboid-engine/src/zombie/iso/worldgen/biomes/feature_type.rs |
+| zombie.iso.worldgen.biomes.Grass | 0 / 0 | crates/zomboid-engine/src/zombie/iso/worldgen/biomes/grass.rs |
+| zombie.iso.worldgen.biomes.TileGroup | 0 / 0 | crates/zomboid-engine/src/zombie/iso/worldgen/biomes/tile_group.rs |
+| zombie.iso.worldgen.enums.TileLookup | 0 / 0 | crates/zomboid-engine/src/zombie/iso/worldgen/enums/tile_lookup.rs |
+| zombie.iso.worldgen.enums.TileLookupRetValue | 0 / 0 | crates/zomboid-engine/src/zombie/iso/worldgen/enums/tile_lookup_ret_value.rs |
+| zombie.iso.worldgen.enums.TileReplacement | 0 / 0 | crates/zomboid-engine/src/zombie/iso/worldgen/enums/tile_replacement.rs |
+| zombie.iso.worldgen.enums.TileReplacementRetValue | 0 / 0 | crates/zomboid-engine/src/zombie/iso/worldgen/enums/tile_replacement_ret_value.rs |
+| zombie.iso.worldgen.maps.BiomeMap | 0 / 12 | crates/zomboid-engine/src/zombie/iso/worldgen/maps/biome_map.rs |
+| zombie.iso.worldgen.maps.BiomeMapEntry | 0 / 0 | crates/zomboid-engine/src/zombie/iso/worldgen/maps/biome_map_entry.rs |
+| zombie.iso.worldgen.maps.BiomeRaster | 0 / 2 | crates/zomboid-engine/src/zombie/iso/worldgen/maps/biome_raster.rs |
+| zombie.iso.worldgen.roads.Road | 3 / 11 | crates/zomboid-engine/src/zombie/iso/worldgen/roads/road.rs |
+| zombie.iso.worldgen.roads.RoadConfig | 0 / 0 | crates/zomboid-engine/src/zombie/iso/worldgen/roads/road_config.rs |
+| zombie.iso.worldgen.roads.RoadDirection | 0 / 0 | crates/zomboid-engine/src/zombie/iso/worldgen/roads/road_direction.rs |
+| zombie.iso.worldgen.roads.RoadEdge | 1 / 3 | crates/zomboid-engine/src/zombie/iso/worldgen/roads/road_edge.rs |
+| zombie.iso.worldgen.roads.RoadGenerator | 0 / 9 | crates/zomboid-engine/src/zombie/iso/worldgen/roads/road_generator.rs |
+| zombie.iso.worldgen.roads.RoadNexus | 0 / 4 | crates/zomboid-engine/src/zombie/iso/worldgen/roads/road_nexus.rs |
+| zombie.iso.worldgen.utils.AreaSquareVar | 9 / 9 | crates/zomboid-engine/src/zombie/iso/worldgen/utils/area_square_var.rs |
+| zombie.iso.worldgen.utils.CacheMap | 2 / 2 | crates/zomboid-engine/src/zombie/iso/worldgen/utils/cache_map.rs |
+| zombie.iso.worldgen.utils.CellCoord | 0 / 0 | crates/zomboid-engine/src/zombie/iso/worldgen/utils/cell_coord.rs |
+| zombie.iso.worldgen.utils.ChunkCoord | 0 / 0 | crates/zomboid-engine/src/zombie/iso/worldgen/utils/chunk_coord.rs |
+| zombie.iso.worldgen.utils.Direction | 6 / 7 | crates/zomboid-engine/src/zombie/iso/worldgen/utils/direction.rs |
+| zombie.iso.worldgen.utils.SquareCoord | 2 / 2 | crates/zomboid-engine/src/zombie/iso/worldgen/utils/square_coord.rs |
+| zombie.iso.worldgen.utils.probabilities.Probability | 0 / 0 | crates/zomboid-engine/src/zombie/iso/worldgen/biomes/probability.rs |
+| zombie.iso.worldgen.utils.triangulation.DelaunayTriangulator | 7 / 7 | crates/zomboid-engine/src/zombie/iso/worldgen/utils/triangulation/delaunay_triangulator.rs |
+| zombie.iso.worldgen.utils.triangulation.Edge2D | 4 / 5 | crates/zomboid-engine/src/zombie/iso/worldgen/utils/triangulation/edge2d.rs |
+| zombie.iso.worldgen.utils.triangulation.EdgeDistancePack | 2 / 2 | crates/zomboid-engine/src/zombie/iso/worldgen/utils/triangulation/edge_distance_pack.rs |
+| zombie.iso.worldgen.utils.triangulation.Triangle2D | 11 / 11 | crates/zomboid-engine/src/zombie/iso/worldgen/utils/triangulation/triangle2d.rs |
+| zombie.iso.worldgen.utils.triangulation.TriangleSoup | 9 / 9 | crates/zomboid-engine/src/zombie/iso/worldgen/utils/triangulation/triangle_soup.rs |
+| zombie.iso.worldgen.utils.triangulation.Vector2D | 9 / 9 | crates/zomboid-engine/src/zombie/iso/worldgen/utils/triangulation/vector2d.rs |
+| zombie.iso.worldgen.veins.OreVein | 2 / 4 | crates/zomboid-engine/src/zombie/iso/worldgen/veins/ore_vein.rs |
+| zombie.iso.worldgen.veins.OreVeinConfig | 0 / 10 | crates/zomboid-engine/src/zombie/iso/worldgen/veins/ore_vein_config.rs |
+| zombie.iso.worldgen.veins.Veins | 1 / 2 | crates/zomboid-engine/src/zombie/iso/worldgen/veins/veins.rs |
+| zombie.iso.worldgen.zombie.ClosestSelection | 0 / 0 | crates/zomboid-engine/src/zombie/iso/worldgen/zombie/closest_selection.rs |
+| zombie.iso.worldgen.zombie.ClosestSelectionType | 0 / 1 | crates/zomboid-engine/src/zombie/iso/worldgen/zombie/closest_selection.rs |
+| zombie.iso.worldgen.zombie.Coord | 0 / 0 | crates/zomboid-engine/src/zombie/iso/worldgen/zombie/coord.rs |
+| zombie.iso.worldgen.zombie.HashUtil | 0 / 3 | crates/zomboid-engine/src/zombie/iso/worldgen/zombie/hash_util.rs |
+| zombie.iso.worldgen.zombie.ZombieVoronoi | 0 / 6 | crates/zomboid-engine/src/zombie/iso/worldgen/zombie/zombie_voronoi.rs |
+| zombie.iso.worldgen.zombie.ZombieVoronoiEntry | 0 / 1 | crates/zomboid-engine/src/zombie/iso/worldgen/zombie/zombie_voronoi_entry.rs |
+| zombie.iso.worldgen.zombie.ZombieVoronoiReader | 0 / 4 | crates/zomboid-engine/src/zombie/iso/worldgen/zombie/zombie_voronoi_reader.rs |
+| zombie.iso.worldgen.zones.AnimalsPathConfig | 0 / 1 | crates/zomboid-engine/src/zombie/iso/worldgen/zones/animals_path_config.rs |
+| zombie.iso.worldgen.zones.WorldGenZone | 0 / 2 | crates/zomboid-engine/src/zombie/iso/worldgen/zones/world_gen_zone.rs |
 | zombie.iso.zones.Zone | 25 / 68 | crates/zomboid-engine/src/zombie/iso/zones/zone.rs |
 | zombie.iso.zones.ZoneGeometryType | 0 / 0 | crates/zomboid-engine/src/zombie/iso/zones/zone_geometry_type.rs |
 | zombie.modding.ActiveMods | 18 / 21 | crates/zomboid-engine/src/zombie/modding/active_mods.rs |
@@ -581,3 +635,10 @@ Method counts are distinct method names per top-level file (overloads and inner 
 | zombie.worldMap.symbols.WorldMapSymbols | 1 / 23 | crates/zomboid-engine/src/zombie/world_map/symbols/world_map_symbols.rs |
 | zombie.worldMap.symbols.WorldMapTextSymbol | 0 / 23 | crates/zomboid-engine/src/zombie/world_map/symbols/world_map_symbols.rs |
 | zombie.worldMap.symbols.WorldMapTextureSymbol | 0 / 12 | crates/zomboid-engine/src/zombie/world_map/symbols/world_map_symbols.rs |
+
+## Citations that match no decompiled class or method (fix the comment)
+
+- zombie.iso.worldgen.utils.CellCoord.hashCode (crates/zomboid-engine/src/zombie/iso/worldgen/utils/cell_coord.rs)
+- zombie.iso.worldgen.utils.ChunkCoord.hashCode (crates/zomboid-engine/src/zombie/iso/worldgen/utils/chunk_coord.rs)
+- zombie.iso.worldgen.utils.SquareCoord.hashCode (crates/zomboid-engine/src/zombie/iso/worldgen/utils/square_coord.rs)
+- zombie.iso.worldgen.utils.probabilities (crates/zomboid-engine/src/zombie/iso/worldgen/biomes/probability.rs)

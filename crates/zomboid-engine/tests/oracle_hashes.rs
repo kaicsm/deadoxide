@@ -1034,3 +1034,32 @@ fn loot_matches_original() {
     check("loot", &args);
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+/// New world-generation oracles become regression gates only after their first successful
+/// byte-for-byte comparison against the original Java. Missing goldens mean UNKNOWN, not PASS.
+fn check_worldgen_when_measured(case: &str, args: &[&str]) {
+    let hash = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("../../tests/golden/engine/{case}.sha256"));
+    if !hash.exists() {
+        eprintln!("SKIPPED {case}: no measured Java/Rust oracle hash yet; run sh tools/oracle.sh {case}");
+        return;
+    }
+    check(case, args);
+}
+
+#[test]
+fn world_gen_tile_matches_original_when_measured() {
+    check_worldgen_when_measured("wgtiles", &["-"]);
+}
+
+#[test]
+fn world_gen_chunk_queries_match_original_when_measured() {
+    check_worldgen_when_measured("wgchunk", &[]);
+}
+
+#[test]
+fn world_gen_generated_chunks_match_original_when_measured() {
+    // Uses real tile definitions and the same 2x2 fixture as WgGenerateProbe.java.
+    // This is activated only after both sides compare byte-for-byte in tools/oracle.sh.
+    check_worldgen_when_measured("wggenerate", &[]);
+}

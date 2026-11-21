@@ -64,3 +64,71 @@ impl WorldGenUtils {
             .map(String::as_str)
     }
 }
+
+/// WorldGenUtils.canPlace: Java String.matches on the generated regex `^` + glob with '.', '*',
+/// and '?' rewritten to `\\.`, `.*`, and `.?` respectively. The original's `matches` requires the
+/// *whole* floor name to match and later patterns override earlier matches. No regex engine is needed
+/// for this restricted syntax.
+pub fn can_place(placement: &[String], floor_name: &str) -> bool {
+    let mut to_be_placed = false;
+    for check in placement {
+        let (allow, pattern) = match check.strip_prefix('!') {
+            Some(rest) => (false, rest),
+            None => (true, check.as_str()),
+        };
+        if matches_tile_pattern(pattern, floor_name) {
+            to_be_placed = allow;
+        }
+    }
+    to_be_placed
+}
+
+/// WorldGenChunk.isProtected and WorldGenUtils.canPlace: the restricted Java regex produced by
+/// escaping '.' and rewriting '*' to `.*` and '?' to `.?`. `*` matches zero or more arbitrary
+/// characters; `?` matches zero or one arbitrary character.
+pub fn matches_tile_pattern(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let mut dp = vec![false; n.len() + 1];
+    dp[0] = true;
+    for c in p {
+        match c {
+            '*' => {
+                for i in 1..=n.len() {
+                    dp[i] = dp[i] || dp[i - 1];
+                }
+            }
+            '?' => {
+                let previous = dp.clone();
+                dp[0] = previous[0];
+                for i in 1..=n.len() {
+                    dp[i] = previous[i] || previous[i - 1];
+                }
+            }
+            literal => {
+                for i in (1..=n.len()).rev() {
+                    dp[i] = dp[i - 1] && n[i - 1] == literal;
+                }
+                dp[0] = false;
+            }
+        }
+    }
+    dp[n.len()]
+}
+
+#[cfg(test)]
+mod pattern_tests {
+    use super::*;
+
+    #[test]
+    fn java_pattern_rewrite_and_last_match_wins() {
+        assert!(matches_tile_pattern("Road_*", "Road_Asphalt"));
+        assert!(!matches_tile_pattern("Road_*", "Road"));
+        assert!(matches_tile_pattern("vegetation_?", "vegetation_a"));
+        assert!(matches_tile_pattern("vegetation_?", "vegetation_"));
+        assert!(!matches_tile_pattern("blends_natural_01_?", "blends_natural_01_123"));
+        let rules = ["blends_*".to_owned(), "!blends_street_*".to_owned()];
+        assert!(can_place(&rules, "blends_natural_01_0"));
+        assert!(!can_place(&rules, "blends_street_01"));
+    }
+}

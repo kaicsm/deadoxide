@@ -21,6 +21,8 @@ mod inventory_dump;
 mod models;
 #[path = "pz-dump-path/mod.rs"]
 mod path_dump;
+#[path = "pz-dump-worldgen.rs"]
+mod worldgen_dump;
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -142,6 +144,9 @@ fn main() {
         Some("wgvoronoi") if a.len() == 4 => wgvoronoi(Path::new(&a[2]), &a[3]),
         Some("wgveins") if a.len() == 4 => wgveins(Path::new(&a[2]), &a[3]),
         Some("wgroads") if a.len() == 3 => wgroads(Path::new(&a[2])),
+        Some("wgtiles") if a.len() == 4 => worldgen_dump::tiles(),
+        Some("wgchunk") if a.len() == 3 => worldgen_dump::chunk(Path::new(&a[2])),
+        Some("wggenerate") if a.len() == 3 => worldgen_dump::generate(Path::new(&a[2])),
         Some("luaload" | "luaserver" | "luaclient") if a.len() >= 4 => {
             luaload(Path::new(&a[2]), &a[3], &a[4..], false)
         }

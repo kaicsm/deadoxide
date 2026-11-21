@@ -72,7 +72,7 @@ server_case() {
   javac -nowarn -encoding UTF-8 -cp "$ROOT/projectzomboid.jar" -sourcepath tests/original_probe -d target/original-probe tests/original_probe/ServerHarness.java "tests/original_probe/$probe.java" 2>target/oracle/$name.javac \
     || { cat target/oracle/$name.javac; echo "FAIL $name (javac)"; fail=1; return; }
   (cd "$ROOT" && java_with_final_field_mutation -Djava.awt.headless=true -Djava.library.path="$PZ_NATIVES" -Xmx4g -cp "$HERE/target/original-probe:projectzomboid.jar" "$probe" "$HERE/target/oracle/pz-oracle-$name" "$@" >"$HERE/target/oracle/$name.java.txt" 2>"$HERE/target/oracle/$name.java.err") \
-    || { grep -n 'ORACLE\|Exception' target/oracle/$name.java.err | tail -5; echo "FAIL $name (server probe)"; fail=1; return; }
+    || { tail -n 40 "target/oracle/$name.java.err"; echo "FAIL $name (server probe)"; fail=1; return; }
   ./target/release/pz-dump "$name" "$ROOT" "$@" >target/oracle/$name.rust.txt 2>target/oracle/$name.rust.err \
     || { tail -5 target/oracle/$name.rust.err; echo "FAIL $name (pz-dump)"; fail=1; return; }
   if cmp -s target/oracle/$name.java.txt target/oracle/$name.rust.txt; then
@@ -336,6 +336,15 @@ sel wgveins && game_case wgveins WgVeinsProbe
 # the real meta grid bounds, with sorted output (the Delaunay edge set and the HashSet orders behind it are
 # identity-hash based and not reproducible between JVM runs)
 sel wgroads && server_case wgroads WgRoadsProbe
+# Direct WorldGenTile oracle: seeded feature selection and private getBiomeTile with
+# synthetic biomes, pending 16x16 groups, error branches, and post-call RNG states.
+sel wgtiles && game_case wgtiles WgTilesProbe
+# WorldGenChunk constructor/public queries against the original dedicated server's state.
+# Generated square object streams and blending are deliberately outside this oracle's scope.
+sel wgchunk && server_case wgchunk WgChunkProbe
+# WorldGenChunk.generateChunks: a controlled empty 2x2 cache (one pre-existing object) on the
+# booted original server, compared against the port using the same Lua tables and tile definitions.
+sel wggenerate && server_case wggenerate WgGenerateProbe
 sel luaload && game_case luaload LuaLoadEnvProbe shared
 sel luaserver && game_case luaserver LuaLoadEnvProbe shared server
 sel luaclient && game_case luaclient LuaLoadEnvProbe shared client

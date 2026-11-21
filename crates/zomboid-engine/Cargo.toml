@@ -3,6 +3,12 @@ name = "zomboid-engine"
 version = "0.1.0"
 edition = "2021"
 description = "Direct Rust port of the game's own Java classes; module paths mirror the zombie.* packages."
+# pz-dump-worldgen.rs is a module of pz-dump, not a standalone binary.
+autobins = false
+
+[[bin]]
+name = "pz-dump"
+path = "src/bin/pz-dump.rs"
 [dependencies]
 # zombie.util.PZXmlUtil: the XML files of the game (clothing.xml...) into a DOM.
 roxmltree = "0.21"

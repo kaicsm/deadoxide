@@ -4,8 +4,9 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-const repo = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..");
+const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const exe = (n) => path.join(repo, "target", "release", n + (process.platform === "win32" ? ".exe" : ""));
 const run = (bin, args) => execFileSync(exe(bin), args, { cwd: repo, encoding: "utf8", maxBuffer: 64 << 20, stdio: ["ignore", "pipe", "pipe"] });
 const pct = (a, b) => (b ? (100 * a) / b : 0);
