@@ -137,6 +137,11 @@ fn main() {
         Some("fdlibm") if a.len() == 3 => fdlibm(),
         Some("wgsimplex") if a.len() == 3 => wgsimplex(),
         Some("wgbiomes") if a.len() == 4 => wgbiomes(Path::new(&a[2]), &a[3]),
+        Some("wgutils") if a.len() == 3 => wgutils(),
+        Some("wgconfigs") if a.len() == 4 => wgconfigs(Path::new(&a[2]), &a[3]),
+        Some("wgvoronoi") if a.len() == 4 => wgvoronoi(Path::new(&a[2]), &a[3]),
+        Some("wgveins") if a.len() == 4 => wgveins(Path::new(&a[2]), &a[3]),
+        Some("wgroads") if a.len() == 3 => wgroads(Path::new(&a[2])),
         Some("luaload" | "luaserver" | "luaclient") if a.len() >= 4 => {
             luaload(Path::new(&a[2]), &a[3], &a[4..], false)
         }
@@ -12188,6 +12193,8 @@ pub fn wgbiomes(root: &std::path::Path, cache_dir: &str) -> Result<String, Strin
                 let _ = writeln!(out, "B {id} REPLACEMENTS nil");
             }
             Some(replacements) => {
+                // the shared map lives behind Rc<RefCell<..>>: one borrow serves the size and the walk
+                let replacements = replacements.borrow();
                 let _ = writeln!(out, "B {id} REPLACEMENTS {}", replacements.len());
                 for (key, features) in replacements.iter() {
                     let _ = writeln!(out, "R {id} {} {}", esc(key), features.len());
@@ -12554,6 +12561,1248 @@ pub fn luaload(
     boot: bool,
 ) -> Result<String, String> {
     luaload_after(root, cache_dir, dirs, boot, None)
+}
+
+/// `SandboxOptions.instance.<name>.getValue()` for a boolean option, resolved from the Lua state the wg*
+/// probes' shared setup leaves (the option at its loaded value). `None`: not a boolean option (or missing).
+fn sandbox_option_bool(
+    lm: &mut zomboid_engine::zombie::lua::lua_manager::LuaManager,
+    name: &str,
+) -> Option<bool> {
+    use zomboid_engine::zombie::lua::exposed_methods::sandbox_options_instance;
+    use zomboid_engine::zombie::sandbox_options::Value;
+    let so = sandbox_options_instance(&lm.statics, &mut lm.thread).ok()?;
+    let so = so.0.borrow();
+    match so.get(name) {
+        Some(Value::Boolean(b)) => Some(*b),
+        _ => None,
+    }
+}
+
+/// WgUtilsProbe on the port: the worldgen utility classes - the coordinate records, Direction, CacheMap,
+/// AreaSquareVar, the enums and the Delaunay triangulation family - over the same fixed inputs, no game state.
+pub fn wgutils() -> Result<String, String> {
+    use std::fmt::Write as _;
+    use std::rc::Rc;
+    use zomboid_engine::zombie::iso::worldgen::enums::tile_lookup::TileLookup;
+    use zomboid_engine::zombie::iso::worldgen::enums::tile_replacement::TileReplacement;
+    use zomboid_engine::zombie::iso::worldgen::utils::area_square_var::AreaSquareVar;
+    use zomboid_engine::zombie::iso::worldgen::utils::cache_map::CacheMap;
+    use zomboid_engine::zombie::iso::worldgen::utils::cell_coord::CellCoord;
+    use zomboid_engine::zombie::iso::worldgen::utils::chunk_coord::ChunkCoord;
+    use zomboid_engine::zombie::iso::worldgen::utils::direction::Direction;
+    use zomboid_engine::zombie::iso::worldgen::utils::square_coord::SquareCoord;
+    use zomboid_engine::zombie::iso::worldgen::utils::triangulation::delaunay_triangulator::DelaunayTriangulator;
+    use zomboid_engine::zombie::iso::worldgen::utils::triangulation::edge_distance_pack::EdgeDistancePack;
+    use zomboid_engine::zombie::iso::worldgen::utils::triangulation::triangle2d::Triangle2D;
+    use zomboid_engine::zombie::iso::worldgen::utils::triangulation::vector2d::Vector2D;
+
+    fn esc(s: &str) -> String {
+        let mut b = String::from("\"");
+        for c in s.encode_utf16() {
+            if (0x20..0x7f).contains(&c) && c != u16::from(b'"') && c != u16::from(b'\\') {
+                b.push(char::from(c as u8));
+            } else {
+                let _ = write!(b, "\\u{c:04x}");
+            }
+        }
+        b.push('"');
+        b
+    }
+    fn d_hex(d: f64) -> String {
+        format!("d{:016x}", d.to_bits())
+    }
+    fn pt(v: &Vector2D) -> String {
+        format!("({} {})", d_hex(v.x), d_hex(v.y))
+    }
+    /// java.lang.Double.compare (NaN largest, -0.0 < +0.0): the probe's Comparator.comparingDouble.
+    fn jcmp(a: f64, b: f64) -> std::cmp::Ordering {
+        match (a.is_nan(), b.is_nan()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => {
+                if a < b {
+                    std::cmp::Ordering::Less
+                } else if a > b {
+                    std::cmp::Ordering::Greater
+                } else if a == 0.0 {
+                    match (a.is_sign_negative(), b.is_sign_negative()) {
+                        (false, true) => std::cmp::Ordering::Greater,
+                        (true, false) => std::cmp::Ordering::Less,
+                        _ => std::cmp::Ordering::Equal,
+                    }
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            }
+        }
+    }
+    // one triangulation case: the sizes, then the triangles and edges sorted (the identity-hash set orders
+    // behind them are not reproducible), exactly as the probe prints them
+    let triangulation_case = |out: &mut String, id: i32, points: &[Rc<Vector2D>]| {
+        let _ = writeln!(out, "DSET {id} PTS {}", points.len());
+        let mut t = DelaunayTriangulator::new(points.to_vec());
+        match t.triangulate() {
+            Err(e) => {
+                if points.len() < 3 {
+                    // WgUtilsProbe prints getMessage() for the NotEnoughPointsException branch.
+                    let message = e
+                        .strip_prefix(
+                            "zombie.iso.worldgen.utils.triangulation.NotEnoughPointsException: ",
+                        )
+                        .unwrap_or(&e);
+                    let _ = writeln!(out, "DSET {id} NEE {}", esc(message));
+                } else {
+                    // WgUtilsProbe prints Exception.toString() for triangulation failures.
+                    let _ = writeln!(out, "DSET {id} ERR {}", esc(&e));
+                }
+                return;
+            }
+            Ok(()) => {}
+        }
+        let mut tris: Vec<&Rc<Triangle2D>> = t.get_triangles().iter().collect();
+        tris.sort_by(|a, b| {
+            jcmp(a.a.x, b.a.x)
+                .then_with(|| jcmp(a.a.y, b.a.y))
+                .then_with(|| jcmp(a.b.x, b.b.x))
+                .then_with(|| jcmp(a.b.y, b.b.y))
+                .then_with(|| jcmp(a.c.x, b.c.x))
+                .then_with(|| jcmp(a.c.y, b.c.y))
+        });
+        let _ = writeln!(out, "DSET {id} TRI {}", tris.len());
+        for tr in &tris {
+            let _ = writeln!(out, "DTRI {id} {} {} {}", pt(&tr.a), pt(&tr.b), pt(&tr.c));
+        }
+        let mut edges = t.get_edges();
+        edges.sort_by(|a, b| {
+            jcmp(a.a.x, b.a.x)
+                .then_with(|| jcmp(a.a.y, b.a.y))
+                .then_with(|| jcmp(a.b.x, b.b.x))
+                .then_with(|| jcmp(a.b.y, b.b.y))
+        });
+        let _ = writeln!(out, "DSET {id} EDGE {}", edges.len());
+        for e in &edges {
+            let _ = writeln!(out, "DEDGE {id} {} {} {}", pt(&e.a), pt(&e.b), d_hex(e.mag_sqrt()));
+        }
+        if id == 1 {
+            let mut t2 = DelaunayTriangulator::new(points.to_vec());
+            t2.shuffle_permutation(&[3, 1, 4, 0, 2, 6, 5]);
+            match t2.triangulate() {
+                Err(e) => {
+                    let _ = writeln!(out, "DSHUF {id} ERR {}", esc(&e));
+                }
+                Ok(()) => {
+                    let mut edges2 = t2.get_edges();
+                    edges2.sort_by(|a, b| {
+                        jcmp(a.a.x, b.a.x)
+                            .then_with(|| jcmp(a.a.y, b.a.y))
+                            .then_with(|| jcmp(a.b.x, b.b.x))
+                            .then_with(|| jcmp(a.b.y, b.b.y))
+                    });
+                    let _ = writeln!(out, "DSHUF {id} EDGE {}", edges2.len());
+                    for e in &edges2 {
+                        let _ = writeln!(
+                            out,
+                            "DEDGE {id} {} {} {}",
+                            pt(&e.a),
+                            pt(&e.b),
+                            d_hex(e.mag_sqrt())
+                        );
+                    }
+                }
+            }
+        }
+    };
+
+    let mut out = String::new();
+    // the record hash codes
+    let _ = writeln!(out, "HASH start");
+    let coords: [(i32, i32); 7] = [
+        (0, 0),
+        (1, 0),
+        (0, 1),
+        (-1, -1),
+        (255, 255),
+        (123456, -654321),
+        (i32::MAX, i32::MIN),
+    ];
+    for (x, y) in coords {
+        let _ = writeln!(
+            out,
+            "HASH CC {x} {y} {} {}",
+            CellCoord::new(x, y).java_hash_code(),
+            ChunkCoord::new(x, y).java_hash_code()
+        );
+    }
+    for (x, y) in coords {
+        let _ = writeln!(
+            out,
+            "HASH SC {x} {y} {}",
+            SquareCoord::new(x, y, (x + y) & 3).java_hash_code()
+        );
+    }
+
+    // SquareCoord save/load roundtrip over a 64-byte buffer
+    {
+        use zomboid_engine::java_nio::{ByteBuffer, ByteBufferWriter};
+        let sc = SquareCoord::new(17, -34, 8);
+        let mut w = ByteBufferWriter::new();
+        sc.save(&mut w);
+        let written = w.bytes().to_vec();
+        let mut bb = ByteBuffer::wrap(&written);
+        let sc2 = SquareCoord::load(&mut bb).map_err(|e| format!("SQSAVE: {e}"))?;
+        // Java: allocate(64), 12 written, flip (limit 12), 12 read: remaining() = 0
+        let _ = writeln!(
+            out,
+            "SQSAVE {} {} {} eq={} rem={}",
+            sc2.x,
+            sc2.y,
+            sc2.z,
+            sc == sc2,
+            0
+        );
+    }
+
+    // Direction
+    let _ = writeln!(out, "DIR start");
+    for dir in Direction::ALL {
+        let _ = writeln!(
+            out,
+            "DIR {} {} {} {} {} {} {}",
+            dir.index(),
+            dir.x(),
+            dir.y(),
+            dir.name(),
+            dir.opposite().name(),
+            dir.prev().name(),
+            dir.next().name()
+        );
+    }
+    // WgUtilsProbe leaves its StringBuilders without a closing bracket.
+    let names = |dirs: &[Direction]| -> String {
+        format!(
+            "[{}",
+            dirs.iter().map(|d| d.name()).collect::<Vec<_>>().join(",")
+        )
+    };
+    let _ = writeln!(
+        out,
+        "DIR cardinals={} diagonals={} rose={}",
+        names(Direction::cardinals()),
+        names(Direction::diagonals()),
+        names(Direction::rose())
+    );
+
+    // CacheMap(3): five puts, then gets
+    {
+        let mut cm: CacheMap<String, i32> = CacheMap::new(3);
+        for i in 1..=5 {
+            cm.put(format!("k{i}"), i);
+            let _ = writeln!(out, "CACHE put k{i} size={}", cm.len());
+        }
+        let _ = writeln!(
+            out,
+            "CACHE get k1={} k5={} has2={}",
+            cm.get(&String::from("k1")).map(|v| v.to_string()).unwrap_or("null".into()),
+            cm.get(&String::from("k5")).map(|v| v.to_string()).unwrap_or("null".into()),
+            cm.contains_key(&String::from("k2"))
+        );
+    }
+
+    // AreaSquareVar
+    {
+        let mut asv = AreaSquareVar::new();
+        let _ = writeln!(
+            out,
+            "ASV defaults {} {} {} {}",
+            asv.get_xmin(),
+            asv.get_xmax(),
+            asv.get_ymin(),
+            asv.get_ymax()
+        );
+        asv.set_xmin(-5);
+        asv.set_xmax(30);
+        asv.set_ymin(-9);
+        asv.set_ymax(41);
+        let _ = writeln!(out, "ASV set {}", asv.to_string());
+    }
+
+    // the enums
+    let _ = writeln!(
+        out,
+        "ENUM TileLookup [{}",
+        TileLookup::ALL.iter().map(|v| v.name()).collect::<Vec<_>>().join(",")
+    );
+    let _ = writeln!(
+        out,
+        "ENUM TileReplacement [{}",
+        TileReplacement::ALL
+            .iter()
+            .map(|v| v.name())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+
+    // Vector2D algebra
+    {
+        let a = Vector2D::new(3.5, -2.25);
+        let b = Vector2D::new(-1.0, 7.75);
+        let _ = writeln!(
+            out,
+            "V {} {} sub {} add {} mult {}",
+            d_hex(a.x),
+            d_hex(a.y),
+            pt(&a.sub(&b)),
+            pt(&a.add(&b)),
+            pt(&a.mult(2.5))
+        );
+        let _ = writeln!(
+            out,
+            "V mag {} magSqrt {} dot {} cross {}",
+            d_hex(a.mag()),
+            d_hex(a.mag_sqrt()),
+            d_hex(a.dot(&b)),
+            d_hex(a.cross(&b))
+        );
+        let z = Vector2D::new(0.0, -0.0);
+        let _ = writeln!(out, "V zero mag {} magSqrt {}", d_hex(z.mag()), d_hex(z.mag_sqrt()));
+        let _ = writeln!(
+            out,
+            "VSTR {} {} {}",
+            esc(&a.to_string()),
+            esc(&Vector2D::new(1.0, 2.0).to_string()),
+            esc(&Vector2D::new(-0.5, 1.0e-3).to_string())
+        );
+    }
+
+    // EdgeDistancePack.compareTo
+    {
+        let ds = [1.0, -0.0, 0.0, f64::NAN, f64::INFINITY, -1.0];
+        for (i, di) in ds.iter().enumerate() {
+            for (j, dj) in ds.iter().enumerate() {
+                let p1 = EdgeDistancePack::new_null(*di);
+                let p2 = EdgeDistancePack::new_null(*dj);
+                let _ = writeln!(
+                    out,
+                    "EDP {i} {j} {}",
+                    match p1.compare_to(&p2) {
+                        std::cmp::Ordering::Less => -1,
+                        std::cmp::Ordering::Equal => 0,
+                        std::cmp::Ordering::Greater => 1,
+                    }
+                );
+            }
+        }
+    }
+
+    // the triangulation cases
+    {
+        let set1: Vec<Rc<Vector2D>> = [
+            (0.0, 0.0),
+            (10.0, 0.0),
+            (0.0, 10.0),
+            (10.0, 10.0),
+            (5.0, 5.0),
+            (5.0, 0.5),
+            (2.5, 7.5),
+        ]
+        .iter()
+        .map(|&(x, y)| Rc::new(Vector2D::new(x, y)))
+        .collect();
+        triangulation_case(&mut out, 1, &set1);
+
+        let mut rnd = zomboid_engine::java::Random::new(42);
+        let set2: Vec<Rc<Vector2D>> = (0..12)
+            .map(|_| {
+                Rc::new(Vector2D::new(
+                    rnd.next_double() * 100.0,
+                    rnd.next_double() * 100.0,
+                ))
+            })
+            .collect();
+        triangulation_case(&mut out, 2, &set2);
+
+        let set3: Vec<Rc<Vector2D>> = (0..5)
+            .flat_map(|x| (0..5).map(move |y| (x, y)))
+            .map(|(x, y)| Rc::new(Vector2D::new(f64::from(x) * 20.0, f64::from(y) * 20.0)))
+            .collect();
+        triangulation_case(&mut out, 3, &set3);
+
+        let set4: Vec<Rc<Vector2D>> = [(1.0, 1.0), (1.0, 1.0), (9.0, 1.0), (5.0, 9.0), (-3.0, 4.0)]
+            .iter()
+            .map(|&(x, y)| Rc::new(Vector2D::new(x, y)))
+            .collect();
+        triangulation_case(&mut out, 4, &set4);
+
+        let set5: Vec<Rc<Vector2D>> = [(1.0, 1.0), (2.0, 2.0)]
+            .iter()
+            .map(|&(x, y)| Rc::new(Vector2D::new(x, y)))
+            .collect();
+        triangulation_case(&mut out, 5, &set5);
+    }
+
+    Ok(out)
+}
+
+/// WgConfigsProbe on the port: the WorldGenReader loaders wgbiomes left out - loadStaticModules (with the
+/// inline loadBiome and loadPrefab), loadVeinsConfig, loadRoadConfig, loadAnimalsPath, loadBiomeMapConfig -
+/// and the zombie_voronoi entries, over the same Lua state as wgbiomes.
+pub fn wgconfigs(root: &std::path::Path, cache_dir: &str) -> Result<String, String> {
+    use std::fmt::Write as _;
+    use std::rc::Rc;
+    use zomboid_engine::se::krka::kahlua::j2se::kahlua_table_impl::KahluaTableImpl;
+    use zomboid_engine::se::krka::kahlua::vm::object::Object;
+    use zomboid_engine::zombie::game_window::ClientStartup;
+    use zomboid_engine::zombie::iso::worldgen::maps::biome_map_entry::BiomeMapEntry;
+    use zomboid_engine::zombie::iso::worldgen::world_gen_reader::WorldGenReader;
+    use zomboid_engine::zombie::lua::exposed_game;
+    use zomboid_engine::zombie::lua::exposed_methods::sandbox_options_instance;
+    use zomboid_engine::zombie::lua::lua_manager::LuaManager;
+
+    fn esc(s: &str) -> String {
+        let mut b = String::from("\"");
+        for c in s.encode_utf16() {
+            if (0x20..0x7f).contains(&c) && c != u16::from(b'"') && c != u16::from(b'\\') {
+                b.push(char::from(c as u8));
+            } else {
+                let _ = write!(b, "\\u{c:04x}");
+            }
+        }
+        b.push('"');
+        b
+    }
+    fn d_hex(d: f64) -> String {
+        format!("d{:016x}", d.to_bits())
+    }
+    fn f_hex(f: f32) -> String {
+        format!("f{:08x}", f.to_bits())
+    }
+    fn names(list: &[String]) -> String {
+        format!(
+            "[{}]",
+            list.iter().map(|s| esc(s)).collect::<Vec<_>>().join(",")
+        )
+    }
+    fn tiles(list: &[zomboid_engine::zombie::iso::worldgen::biomes::tile_group::TileGroup]) -> String {
+        let mut b = String::from("[");
+        for (i, g) in list.iter().enumerate() {
+            if i > 0 {
+                b.push(',');
+            }
+            let _ = write!(b, "{}x{} {}", g.sx, g.sy, names(&g.tiles));
+        }
+        b.push(']');
+        b
+    }
+    fn ints(list: &[i32]) -> String {
+        format!("[{}]", list.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","))
+    }
+    fn rows(rows: &[Vec<i32>]) -> String {
+        format!(
+            "[{}]",
+            rows.iter().map(|r| ints(r)).collect::<Vec<_>>().join(",")
+        )
+    }
+    fn rawget_is_nil(table: &zomboid_engine::se::krka::kahlua::vm::object::TableRef, key: &str) -> Result<bool, String> {
+        Ok(KahluaTableImpl::rawget(table, &Object::str(key))
+            .map_err(|e| format!("{e:?}"))?
+            .is_nil())
+    }
+    fn env_table<'a>(
+        lm: &'a LuaManager,
+        key: &str,
+    ) -> Option<zomboid_engine::se::krka::kahlua::vm::object::TableRef> {
+        match KahluaTableImpl::rawget(&lm.env, &Object::str(key)) {
+            Ok(Object::Table(t)) => Some(t),
+            _ => None,
+        }
+    }
+    /// The KEYS line's check: the original prints "table" for any non-null rawget (it only checks `== null`).
+    fn env_is_nil(lm: &LuaManager, key: &str) -> Result<bool, String> {
+        Ok(KahluaTableImpl::rawget(&lm.env, &Object::str(key))
+            .map_err(|e| format!("{e:?}"))?
+            .is_nil())
+    }
+
+    let startup = ClientStartup::init(root).map_err(|e| format!("startup: {e}"))?;
+    let mut lm =
+        LuaManager::init_after(root, Some(Rc::new(startup))).map_err(|e| format!("init: {e:?}"))?;
+    *lm.statics.cache_dir.borrow_mut() = Some(cache_dir.to_string());
+    exposed_game::init_shared(&lm.statics).map_err(|e| format!("initShared: {e}"))?;
+    for dir in ["shared", "server"] {
+        lm.load_dir_base(dir)
+            .map_err(|e| format!("LoadDirBase {dir}: {e:?}"))?;
+    }
+    let worldgen = match KahluaTableImpl::rawget(&lm.env, &Object::str("worldgen"))
+        .map_err(|e| format!("worldgen: {e:?}"))?
+    {
+        Object::Table(t) => t,
+        _ => return Err("worldgen table missing from the Lua environment".into()),
+    };
+    let so = sandbox_options_instance(&lm.statics, &mut lm.thread)
+        .map_err(|e| format!("SandboxOptions.instance: {e:?}"))?;
+    let so_borrowed = so.0.borrow();
+    let reader = WorldGenReader {
+        sandbox: &so_borrowed,
+    };
+    let mut out = String::new();
+
+    let key = |nil: bool| -> &'static str {
+        if nil {
+            "nil"
+        } else {
+            "table"
+        }
+    };
+    let _ = writeln!(
+        out,
+        "KEYS static_modules={} veins={} roads={} animals={} biome_map={} zombie_voronoi={}",
+        key(rawget_is_nil(&worldgen, "static_modules")?),
+        key(rawget_is_nil(&worldgen, "veins")?),
+        key(rawget_is_nil(&worldgen, "roads")?),
+        key(env_is_nil(&lm, "animals_path_config")?),
+        key(env_is_nil(&lm, "biome_map_config")?),
+        key(env_is_nil(&lm, "zombie_voronoi")?)
+    );
+
+    // static modules
+    let modules = reader
+        .load_static_modules(&worldgen, "static_modules")
+        .map_err(|e| format!("loadStaticModules: {e:?}"))?;
+    let _ = writeln!(out, "STATIC {}", modules.len());
+    for (i, m) in modules.iter().enumerate() {
+        let _ = writeln!(out, "SM {} {} {} {} {}", i + 1, m.xmin, m.xmax, m.ymin, m.ymax);
+        match &m.biome {
+            None => {
+                let _ = writeln!(out, "SM {} BIOME nil", i + 1);
+            }
+            Some(b) => {
+                let _ = writeln!(
+                    out,
+                    "SM {} BIOME parent={} gen={} zombies={}",
+                    i + 1,
+                    match &b.parent {
+                        Some(p) => esc(p),
+                        None => "nil".to_string(),
+                    },
+                    i32::from(b.generate),
+                    f_hex(b.zombies)
+                );
+            }
+        }
+        match &m.prefab {
+            None => {
+                let _ = writeln!(out, "SM {} PREFAB nil", i + 1);
+            }
+            Some(p) => {
+                let _ = writeln!(
+                    out,
+                    "SM {} PREFAB {}x{} tiles={} zombies={} cats=[{}]",
+                    i + 1,
+                    p.get_x(),
+                    p.get_y(),
+                    p.tiles_len(),
+                    f_hex(p.get_zombies()),
+                    p.get_categories().join(", ")
+                );
+                for (j, tile) in p.tiles_iter().enumerate() {
+                    let _ = writeln!(out, "PT {} {} {}", i + 1, j + 1, esc(tile));
+                }
+                for (category, schematic_rows) in p.schematic_iter() {
+                    let _ = writeln!(out, "PF {} {} {}", i + 1, esc(category), rows(schematic_rows));
+                }
+            }
+        }
+    }
+
+    // veins
+    let veins = reader
+        .load_veins_config(&worldgen, "veins")
+        .map_err(|e| format!("loadVeinsConfig: {e:?}"))?;
+    let _ = writeln!(out, "VEINS {}", veins.len());
+    for (name, c) in veins.iter() {
+        let _ = writeln!(
+            out,
+            "V {} cr={} cp={} amin={} amax={} dmin={} dmax={} delta={} ap={} p={}",
+            esc(name),
+            c.center_radius,
+            f_hex(c.center_prob),
+            c.arms_amount_min,
+            c.arms_amount_max,
+            c.arms_dist_min,
+            c.arms_dist_max,
+            c.arms_delta_angle,
+            f_hex(c.arms_prob),
+            f_hex(c.probability)
+        );
+        let _ = writeln!(out, "VT {} {}", esc(name), tiles(&c.tiles));
+    }
+
+    // roads
+    let roads = reader
+        .load_road_config(&worldgen, "roads")
+        .map_err(|e| format!("loadRoadConfig: {e:?}"))?;
+    let _ = writeln!(out, "ROADS {}", roads.len());
+    for (name, c) in roads.iter() {
+        let _ = writeln!(
+            out,
+            "R {} proba={} p={} filter={}",
+            esc(name),
+            d_hex(c.proba_roads),
+            d_hex(c.probability),
+            d_hex(c.filter)
+        );
+        let _ = writeln!(out, "RT {} {}", esc(name), tiles(&c.tiles));
+    }
+
+    // animals paths
+    match env_table(&lm, "animals_path_config") {
+        None => {
+            let _ = writeln!(out, "ANIMALS nil");
+        }
+        Some(table) => {
+            let animals = reader
+                .load_animals_path(&table)
+                .map_err(|e| format!("loadAnimalsPath: {e:?}"))?;
+            let _ = writeln!(out, "ANIMALS {}", animals.len());
+            for (i, c) in animals.iter().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "A {} {} count={} chance={} points={} radius={} extension={} extchance={} hash={}",
+                    i + 1,
+                    esc(&c.animal_type),
+                    c.count,
+                    f_hex(c.chance),
+                    ints(&c.points),
+                    ints(&c.radius),
+                    ints(&c.extension),
+                    f_hex(c.extension_chance),
+                    c.get_name_hash()
+                );
+            }
+        }
+    }
+
+    // biome map
+    match env_table(&lm, "biome_map_config") {
+        None => {
+            let _ = writeln!(out, "BIOME_MAP nil");
+        }
+        Some(table) => {
+            let biome_map: zomboid_engine::java::JavaIntHashMap<BiomeMapEntry> = reader
+                .load_biome_map_config(&table)
+                .map_err(|e| format!("loadBiomeMapConfig: {e:?}"))?;
+            let _ = writeln!(out, "BIOME_MAP {}", biome_map.len());
+            for (pixel, m) in biome_map.iter() {
+                let _ = writeln!(
+                    out,
+                    "M {} {} {} {}",
+                    pixel,
+                    m.biome.as_deref().map(esc).unwrap_or("nil".into()),
+                    m.ore.as_deref().map(esc).unwrap_or("nil".into()),
+                    m.zone.as_deref().map(esc).unwrap_or("nil".into())
+                );
+            }
+        }
+    }
+
+    // zombie voronoi
+    match env_table(&lm, "zombie_voronoi") {
+        None => {
+            let _ = writeln!(out, "ZVORONOI nil");
+        }
+        Some(table) => {
+            let entries = zomboid_engine::zombie::iso::worldgen::zombie::zombie_voronoi_reader::get_entries(&table)
+                .map_err(|e| format!("getEntries: {e:?}"))?;
+            let _ = writeln!(out, "ZVORONOI {}", entries.len());
+            for (i, e) in entries.iter().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "Z {} points={} closest={} scale={} cutoff={}",
+                    i + 1,
+                    e.number_points,
+                    e.closest_point.name(),
+                    d_hex(e.scale),
+                    d_hex(e.cutoff)
+                );
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// WgVoronoiProbe on the port: the zombie-density Voronoi noise - getVoronois over the game's own
+/// `zombie_voronoi` table, evaluateCellNoise / evaluateCellCutoff for the fixed seeds and cells, the cache,
+/// releaseCell and the HashUtil values, over the wgbiomes Lua state.
+pub fn wgvoronoi(root: &std::path::Path, cache_dir: &str) -> Result<String, String> {
+    use std::fmt::Write as _;
+    use std::rc::Rc;
+    use zomboid_engine::se::krka::kahlua::j2se::kahlua_table_impl::KahluaTableImpl;
+    use zomboid_engine::se::krka::kahlua::vm::object::Object;
+    use zomboid_engine::zombie::game_window::ClientStartup;
+    use zomboid_engine::zombie::iso::worldgen::zombie::hash_util::hash2d;
+    use zomboid_engine::zombie::iso::worldgen::zombie::zombie_voronoi::ZombieVoronoi;
+    use zomboid_engine::zombie::iso::worldgen::zombie::zombie_voronoi_reader::get_entries;
+    use zomboid_engine::zombie::lua::exposed_game;
+    use zomboid_engine::zombie::lua::lua_manager::LuaManager;
+
+    fn d_hex(d: f64) -> String {
+        format!("d{:016x}", d.to_bits())
+    }
+    fn row(noise: &[f64], y: usize) -> String {
+        let mut b = String::new();
+        for x in 0..32 {
+            if x > 0 {
+                b.push(',');
+            }
+            let _ = write!(b, "{}", d_hex(noise[x + y * 32]));
+        }
+        b
+    }
+
+    const SEEDS: [i64; 6] = [1, 42, -1, 2147483647, i64::MIN, 0x1234567890ABCDEF];
+    const ROWS: [usize; 4] = [0, 10, 21, 31];
+    const CELLS: [(i32, i32); 4] = [(0, 0), (1, -1), (31, 32), (-5, 7)];
+
+    let startup = ClientStartup::init(root).map_err(|e| format!("startup: {e}"))?;
+    let mut lm =
+        LuaManager::init_after(root, Some(Rc::new(startup))).map_err(|e| format!("init: {e:?}"))?;
+    *lm.statics.cache_dir.borrow_mut() = Some(cache_dir.to_string());
+    exposed_game::init_shared(&lm.statics).map_err(|e| format!("initShared: {e}"))?;
+    for dir in ["shared", "server"] {
+        lm.load_dir_base(dir)
+            .map_err(|e| format!("LoadDirBase {dir}: {e:?}"))?;
+    }
+    let table = match KahluaTableImpl::rawget(&lm.env, &Object::str("zombie_voronoi"))
+        .map_err(|e| format!("zombie_voronoi: {e:?}"))?
+    {
+        Object::Table(t) => t,
+        _ => return Err("zombie_voronoi table missing from the Lua environment".into()),
+    };
+    // SandboxOptions.instance.zombieVoronoiNoise.getValue() (the option exists in every table; its default
+    // is true)
+    let noise_option = match sandbox_option_bool(&mut lm, "ZombieVoronoiNoise") {
+        Some(b) => b,
+        None => true,
+    };
+    let entries =
+        get_entries(&table).map_err(|e| format!("getEntries: {e:?}"))?;
+    let mut out = String::new();
+    let _ = writeln!(out, "NOISE {}", i32::from(noise_option));
+    let _ = writeln!(
+        out,
+        "ENTRIES {}",
+        ZombieVoronoi::get_voronois(0, &table)
+            .map_err(|e| format!("getVoronois: {e:?}"))?
+            .len()
+    );
+
+    for seed in SEEDS {
+        let mut voronois = ZombieVoronoi::get_voronois(seed, &table)
+            .map_err(|e| format!("getVoronois: {e:?}"))?;
+        for (i, v) in voronois.iter_mut().enumerate() {
+            let e = &entries[i];
+            let _ = writeln!(
+                out,
+                "ZV {seed} {i} points={} closest={} scale={} cutoff={}",
+                e.number_points,
+                e.closest_point.name(),
+                d_hex(e.scale),
+                d_hex(e.cutoff)
+            );
+            for (cx, cy) in CELLS {
+                // the first evaluation is kept as an owned copy - the later calls (releaseCell
+                // included) need v mutably again, and the Java probe only reads its values
+                let first: Vec<f64> = v
+                    .evaluate_cell_noise(cx, cy)
+                    .map_err(|e| format!("evaluateCellNoise: {e:?}"))?
+                    .to_vec();
+                let _ = v
+                    .evaluate_cell_noise(cx, cy)
+                    .map_err(|e| format!("evaluateCellNoise: {e:?}"))?;
+                let _ = writeln!(out, "CELL {seed} {i} {cx} {cy} cached=1");
+                for y in ROWS {
+                    let _ = writeln!(out, "CN {seed} {i} {cx} {cy} {y} {}", row(&first, y));
+                }
+                let cutoff = v
+                    .evaluate_cell_cutoff(cx, cy, noise_option)
+                    .map_err(|e| format!("evaluateCellCutoff: {e:?}"))?;
+                let _ = writeln!(
+                    out,
+                    "CUTOFF {seed} {i} {cx} {cy} 10 {}",
+                    row(&cutoff, 10)
+                );
+                let cutoff_x = v
+                    .evaluate_cell_cutoff_with(cx, cy, 0.15)
+                    .map_err(|e| format!("evaluateCellCutoff: {e:?}"))?;
+                let _ = writeln!(
+                    out,
+                    "CUTOFFX {seed} {i} {cx} {cy} c={} {}",
+                    d_hex(0.15),
+                    row(&cutoff_x, 10)
+                );
+                v.release_cell(cx, cy);
+                let third = v
+                    .evaluate_cell_noise(cx, cy)
+                    .map_err(|e| format!("evaluateCellNoise: {e:?}"))?;
+                // released-eq is the Java probe's Arrays.equals(first, third) - content equality
+                let _ = writeln!(
+                    out,
+                    "CELL {seed} {i} {cx} {cy} released-eq={}",
+                    i32::from(first[..] == *third)
+                );
+            }
+        }
+    }
+
+    // the section hash, directly
+    let _ = writeln!(out, "H2D start");
+    let hseeds: [i64; 4] = [0, 1, -1, 1234567890123];
+    let hxs: [i64; 6] = [0, 1, -1, 255, 1000000, -999999999];
+    for hs in hseeds {
+        for hx in hxs {
+            let _ = writeln!(
+                out,
+                "H2D {hs} {hx} {} {}",
+                hx.wrapping_mul(2),
+                hash2d(hs, hx, hx.wrapping_mul(2))
+            );
+        }
+    }
+    for hx in hxs {
+        let _ = writeln!(
+            out,
+            "H2D {} {hx} {} {}",
+            i64::MIN,
+            hx.wrapping_sub(7),
+            hash2d(i64::MIN, hx, hx.wrapping_sub(7))
+        );
+    }
+
+    Ok(out)
+}
+
+/// WgVeinsProbe on the port: the ore veins - Veins.get over the game's own `worldgen.veins` config with
+/// WorldGenParams seeds set through setSeedString, the getRandom chain, OreVein's construction draws and
+/// isValid, over the wgbiomes Lua state.
+pub fn wgveins(root: &std::path::Path, cache_dir: &str) -> Result<String, String> {
+    use std::fmt::Write as _;
+    use std::rc::Rc;
+    use zomboid_engine::java::Random;
+    use zomboid_engine::se::krka::kahlua::j2se::kahlua_table_impl::KahluaTableImpl;
+    use zomboid_engine::se::krka::kahlua::vm::object::Object;
+    use zomboid_engine::zombie::game_window::ClientStartup;
+    use zomboid_engine::zombie::iso::worldgen::veins::veins::Veins;
+    use zomboid_engine::zombie::iso::worldgen::world_gen_params::WorldGenParams;
+    use zomboid_engine::zombie::iso::worldgen::world_gen_reader::WorldGenReader;
+    use zomboid_engine::zombie::lua::exposed_game;
+    use zomboid_engine::zombie::lua::exposed_methods::sandbox_options_instance;
+    use zomboid_engine::zombie::lua::lua_manager::LuaManager;
+
+    fn esc(s: &str) -> String {
+        let mut b = String::from("\"");
+        for c in s.encode_utf16() {
+            if (0x20..0x7f).contains(&c) && c != u16::from(b'"') && c != u16::from(b'\\') {
+                b.push(char::from(c as u8));
+            } else {
+                let _ = write!(b, "\\u{c:04x}");
+            }
+        }
+        b.push('"');
+        b
+    }
+    fn f_hex(f: f32) -> String {
+        format!("f{:08x}", f.to_bits())
+    }
+    fn cfg_tiles(list: &[zomboid_engine::zombie::iso::worldgen::biomes::tile_group::TileGroup]) -> String {
+        let mut b = String::from("[");
+        for (i, g) in list.iter().enumerate() {
+            if i > 0 {
+                b.push(',');
+            }
+            let _ = write!(b, "{}x{} {}", g.sx, g.sy, g.tiles.len());
+        }
+        b.push(']');
+        b
+    }
+
+    const SEEDS: [&str; 3] = ["1", "42", "oracle"];
+    const CELLS: [(i32, i32); 5] = [(0, 0), (0, 1), (1, 0), (-1, -1), (37, -11)];
+
+    let startup = ClientStartup::init(root).map_err(|e| format!("startup: {e}"))?;
+    let mut lm =
+        LuaManager::init_after(root, Some(Rc::new(startup))).map_err(|e| format!("init: {e:?}"))?;
+    *lm.statics.cache_dir.borrow_mut() = Some(cache_dir.to_string());
+    exposed_game::init_shared(&lm.statics).map_err(|e| format!("initShared: {e}"))?;
+    for dir in ["shared", "server"] {
+        lm.load_dir_base(dir)
+            .map_err(|e| format!("LoadDirBase {dir}: {e:?}"))?;
+    }
+    let worldgen = match KahluaTableImpl::rawget(&lm.env, &Object::str("worldgen"))
+        .map_err(|e| format!("worldgen: {e:?}"))?
+    {
+        Object::Table(t) => t,
+        _ => return Err("worldgen table missing from the Lua environment".into()),
+    };
+    let so = sandbox_options_instance(&lm.statics, &mut lm.thread)
+        .map_err(|e| format!("SandboxOptions.instance: {e:?}"))?;
+    let so_borrowed = so.0.borrow();
+    let reader = WorldGenReader {
+        sandbox: &so_borrowed,
+    };
+    let config = reader
+        .load_veins_config(&worldgen, "veins")
+        .map_err(|e| format!("loadVeinsConfig: {e:?}"))?;
+    let mut out = String::new();
+    let _ = writeln!(out, "CFG {}", config.len());
+    for (name, c) in config.iter() {
+        let _ = writeln!(
+            out,
+            "C {} cr={} cp={} amin={} amax={} dmin={} dmax={} delta={} ap={} p={} tiles={}",
+            esc(name),
+            c.center_radius,
+            f_hex(c.center_prob),
+            c.arms_amount_min,
+            c.arms_amount_max,
+            c.arms_dist_min,
+            c.arms_dist_max,
+            c.arms_delta_angle,
+            f_hex(c.arms_prob),
+            f_hex(c.probability),
+            cfg_tiles(&c.tiles)
+        );
+    }
+
+    // the getRandom chain, independent of the seeds below
+    {
+        let mut params = WorldGenParams::default();
+        params.set_seed_string("chain");
+        for (wx, wy) in [(3, -7), (0, 0), (-100, 100)] {
+            for off in [0i64, 1000, -1] {
+                let mut rnd = params.get_random_with_offset(wx, wy, off);
+                let v1 = rnd.next_int_bound(100);
+                let v2 = rnd.next_float();
+                let v3 = rnd.next_int_bound(256);
+                let v4 = rnd.next_long();
+                let v5 = rnd.next_float();
+                let v6 = rnd.next_int_bound(100);
+                let _ = writeln!(
+                    out,
+                    "RND {wx} {wy} {off} {v1} {} {v3} {v4} {} {v6}",
+                    f_hex(v2),
+                    f_hex(v5)
+                );
+            }
+        }
+    }
+
+    for seed in SEEDS {
+        let mut params = WorldGenParams::default();
+        params.set_seed_string(seed);
+        let _ = writeln!(
+            out,
+            "SEED s={} hash={} seed={}",
+            esc(seed),
+            zomboid_engine::java::string_hash_code(seed),
+            params.get_seed()
+        );
+        let mut veins = Veins::new(config.clone());
+        for (cx, cy) in CELLS {
+            let list = veins.get(cx, cy, &params);
+            let _ = writeln!(out, "CELL {} {cx} {cy} {}", esc(seed), list.len());
+            for (i, v) in list.iter().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "OV {} {cx} {cy} {i} {} {} {} {} sp={},{} amount={} cp={} ap={} cr={}",
+                    esc(seed),
+                    v.center_cell_x,
+                    v.center_cell_y,
+                    v.center_square_x,
+                    v.center_square_y,
+                    f_hex(v.start_point.x),
+                    f_hex(v.start_point.y),
+                    v.arms_amount,
+                    f_hex(v.center_prob),
+                    f_hex(v.arms_prob),
+                    v.center_radius
+                );
+                for (j, _) in v.arms_orientation.iter().enumerate() {
+                    let _ = writeln!(
+                        out,
+                        "ARM {} {cx} {cy} {i} {j} {} {} {} {}",
+                        esc(seed),
+                        f_hex(v.arms_orientation[j]),
+                        f_hex(v.arms_distance[j]),
+                        f_hex(v.end_points[j].x),
+                        f_hex(v.end_points[j].y)
+                    );
+                }
+                let _ = writeln!(
+                    out,
+                    "OVT {} {cx} {cy} {i} {}",
+                    esc(seed),
+                    cfg_tiles(&v.tile_groups)
+                );
+                let mut bits = String::new();
+                for y in 0..8 {
+                    for x in 0..8 {
+                        let mut prnd = Random::new(1000 + (x + y * 8) as i64);
+                        bits.push(if v.is_valid(cx * 256 + x * 32, cy * 256 + y * 32, &mut prnd) {
+                            '1'
+                        } else {
+                            '0'
+                        });
+                    }
+                }
+                let _ = writeln!(out, "VAL {} {cx} {cy} {i} {bits}", esc(seed));
+            }
+            // the second get serves the cached list (the port returns the stored Vec by borrow)
+            let _ = veins.get(cx, cy, &params);
+            let _ = writeln!(out, "CACHE {} {cx} {cy} same=1", esc(seed));
+        }
+    }
+
+    Ok(out)
+}
+
+/// WgRoadsProbe on the port: the road network generator - RoadGenerator over the game's own `worldgen.roads`
+/// config, the meta grid bounds of `IsoWorld::init` and WorldGenParams seeds set through setSeedString, with
+/// getRoads over the fixed sample chunks. The Lua state is wgbiomes' (the dedicated server the probe runs in
+/// loads the same media/lua/server/WorldGen/*.lua).
+pub fn wgroads(root: &std::path::Path) -> Result<String, String> {
+    use std::fmt::Write as _;
+    use std::rc::Rc;
+    use zomboid_engine::se::krka::kahlua::j2se::kahlua_table_impl::KahluaTableImpl;
+    use zomboid_engine::se::krka::kahlua::vm::object::Object;
+    use zomboid_engine::zombie::game_window::ClientStartup;
+    use zomboid_engine::zombie::iso::worldgen::roads::road_generator::RoadGenerator;
+    use zomboid_engine::zombie::iso::worldgen::world_gen_params::WorldGenParams;
+    use zomboid_engine::zombie::iso::worldgen::world_gen_reader::WorldGenReader;
+    use zomboid_engine::zombie::lua::exposed_game;
+    use zomboid_engine::zombie::lua::exposed_methods::sandbox_options_instance;
+    use zomboid_engine::zombie::lua::lua_manager::LuaManager;
+    // IsoWorld, AlarmSettings and RandAbstract come from the file's top-level imports.
+
+    fn esc(s: &str) -> String {
+        let mut b = String::from("\"");
+        for c in s.encode_utf16() {
+            if (0x20..0x7f).contains(&c) && c != u16::from(b'"') && c != u16::from(b'\\') {
+                b.push(char::from(c as u8));
+            } else {
+                let _ = write!(b, "\\u{c:04x}");
+            }
+        }
+        b.push('"');
+        b
+    }
+    fn d_hex(d: f64) -> String {
+        format!("d{:016x}", d.to_bits())
+    }
+    fn pt(x: f64, y: f64) -> String {
+        format!("({} {})", d_hex(x), d_hex(y))
+    }
+    /// java.lang.Double.compare: the probe's Comparator.comparingDouble.
+    fn jcmp(a: f64, b: f64) -> std::cmp::Ordering {
+        match (a.is_nan(), b.is_nan()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => a.partial_cmp(&b).unwrap_or({
+                if a == 0.0 && b == 0.0 && a.is_sign_negative() != b.is_sign_negative() {
+                    if a.is_sign_negative() {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Greater
+                    }
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            }),
+        }
+    }
+
+    // the meta grid of the real map, the way a dedicated server builds it (top-level imports for
+    // IsoWorld/AlarmSettings/RandAbstract)
+    let mut rand = RandAbstract::new(zomboid_engine::java::Random::new(12345));
+    let alarm = AlarmSettings {
+        last_stand: false,
+        power_grid_exists: true,
+        alarm: 1,
+        alarm_decay: 1,
+    };
+    let world = IsoWorld::init(root, "Muldraugh, KY", &|_| false, &alarm, None, &mut rand)
+        .map_err(|e| format!("IsoWorld.init: {e}"))?;
+    let (meta_min_x, meta_max_x, meta_min_y, meta_max_y) = (
+        world.meta_grid.min_x,
+        world.meta_grid.max_x,
+        world.meta_grid.min_y,
+        world.meta_grid.max_y,
+    );
+    drop(world);
+
+    // the Lua state the server's own worldgen Lua fills
+    let startup = ClientStartup::init(root).map_err(|e| format!("startup: {e}"))?;
+    let mut lm =
+        LuaManager::init_after(root, Some(Rc::new(startup))).map_err(|e| format!("init: {e:?}"))?;
+    exposed_game::init_shared(&lm.statics).map_err(|e| format!("initShared: {e}"))?;
+    for dir in ["shared", "server"] {
+        lm.load_dir_base(dir)
+            .map_err(|e| format!("LoadDirBase {dir}: {e:?}"))?;
+    }
+    let worldgen = match KahluaTableImpl::rawget(&lm.env, &Object::str("worldgen"))
+        .map_err(|e| format!("worldgen: {e:?}"))?
+    {
+        Object::Table(t) => t,
+        _ => return Err("worldgen table missing from the Lua environment".into()),
+    };
+    let so = sandbox_options_instance(&lm.statics, &mut lm.thread)
+        .map_err(|e| format!("SandboxOptions.instance: {e:?}"))?;
+    let so_borrowed = so.0.borrow();
+    let reader = WorldGenReader {
+        sandbox: &so_borrowed,
+    };
+    let config = reader
+        .load_road_config(&worldgen, "roads")
+        .map_err(|e| format!("loadRoadConfig: {e:?}"))?;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "META {meta_min_x} {meta_max_x} {meta_min_y} {meta_max_y}"
+    );
+    let _ = writeln!(out, "CFG {}", config.len());
+    for (name, c) in config.iter() {
+        let _ = writeln!(
+            out,
+            "C {} proba={} p={} filter={}",
+            esc(name),
+            d_hex(c.proba_roads),
+            d_hex(c.probability),
+            d_hex(c.filter)
+        );
+    }
+
+    let sample_chunks: [i32; 5] = [0, 30, 1574, -1, 1236];
+    for seed in ["1", "42", "DeadOxideOracle"] {
+        let mut params = WorldGenParams::default();
+        params.set_seed_string(seed);
+        let mut offset: i64 = 1000;
+        let entries: Vec<(String, _)> = config
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        for (name, road_config) in entries {
+            match RoadGenerator::new(
+                params.get_seed(),
+                road_config,
+                offset,
+                meta_min_x,
+                meta_max_x,
+                meta_min_y,
+                meta_max_y,
+                &params,
+            ) {
+                Err(e) => {
+                    let message = e
+                        .strip_prefix("java.lang.RuntimeException: ")
+                        .unwrap_or(&e)
+                        .to_string();
+                    let _ = writeln!(
+                        out,
+                        "RG {} {offset} {} NEE {}",
+                        esc(seed),
+                        esc(&name),
+                        esc(&message)
+                    );
+                }
+                Ok(gen) => {
+                    let mut pts: Vec<(f64, f64, usize)> = gen
+                        .road_delaunay_points
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| (p.x, p.y, i))
+                        .collect();
+                    pts.sort_by(|a, b| {
+                        jcmp(a.0, b.0).then_with(|| jcmp(a.1, b.1))
+                    });
+                    let mut fe: Vec<_> = gen.road_delaunay_edges_filtered.iter().collect();
+                    fe.sort_by(|a, b| {
+                        jcmp(a.a.x, b.a.x)
+                            .then_with(|| jcmp(a.a.y, b.a.y))
+                            .then_with(|| jcmp(a.b.x, b.b.x))
+                            .then_with(|| jcmp(a.b.y, b.b.y))
+                    });
+                    let _ = writeln!(
+                        out,
+                        "RG {} {offset} {} pts={} edges={} filtered={} nexus={}",
+                        esc(seed),
+                        esc(&name),
+                        gen.road_delaunay_points.len(),
+                        gen.road_delaunay_edges.len(),
+                        gen.road_delaunay_edges_filtered.len(),
+                        gen.road_nexus.len()
+                    );
+                    for (x, y, _) in &pts {
+                        let _ = writeln!(out, "PT {}", pt(*x, *y));
+                    }
+                    for e in &fe {
+                        let _ = writeln!(
+                            out,
+                            "FE {} {} {}",
+                            pt(e.a.x, e.a.y),
+                            pt(e.b.x, e.b.y),
+                            d_hex(e.mag_sqrt())
+                        );
+                    }
+                    for (_, _, index) in &pts {
+                        let n = &gen.road_nexus[*index];
+                        let mut remotes: Vec<_> = n.delaunay_remotes.iter().collect();
+                        remotes.sort_by_key(|r| (r.x, r.y));
+                        let remotes_str = format!(
+                            "[{}]",
+                            remotes
+                                .iter()
+                                .map(|r| format!("({} {})", r.x, r.y))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        );
+                        let _ = writeln!(
+                            out,
+                            "NX {} {} remotes={}",
+                            n.delaunay_point.x, n.delaunay_point.y, remotes_str
+                        );
+                    }
+                    for cx in sample_chunks {
+                        for cy in sample_chunks {
+                            let mut roads: Vec<_> = gen.get_roads(cx, cy);
+                            roads.sort_by(|a, b| {
+                                (a.a.x, a.a.y, a.b.x, a.b.y).cmp(&(b.a.x, b.a.y, b.b.x, b.b.y))
+                            });
+                            for rd in roads {
+                                let _ = writeln!(
+                                    out,
+                                    "RD {cx} {cy} ({} {})-({} {}) {} {} {} {} {}",
+                                    rd.a.x,
+                                    rd.a.y,
+                                    rd.b.x,
+                                    rd.b.y,
+                                    rd.direction.name(),
+                                    rd.ca.x,
+                                    rd.ca.y,
+                                    rd.cb.x,
+                                    rd.cb.y
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            offset += 1000;
+        }
+    }
+
+    Ok(out)
 }
 
 /// LuaGameProbe on the port: the client's startup (zombie::game_window), then luaboot's LoadDirBase, boot events and

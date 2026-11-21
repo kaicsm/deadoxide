@@ -43,6 +43,28 @@ impl WorldGenParams {
         i64::from(self.seed)
     }
 
+    /// zombie.iso.worldgen.WorldGenParams.getRandom(int, int) (WorldGenParams.java:48-50):
+    /// `return this.getRandom(wx, wy, 0L)`.
+    pub fn get_random(&self, wx: i32, wy: i32) -> java::Random {
+        self.get_random_with_offset(wx, wy, 0)
+    }
+
+    /// zombie.iso.worldgen.WorldGenParams.getRandom(int, int, long) (WorldGenParams.java:52-58):
+    /// `Random tmpRnd = new Random(this.seed + offset)` — the int seed widens to long and the addition
+    /// wraps — then `wxRnd = tmpRnd.nextLong()` and `wyRnd = tmpRnd.nextLong()`, and
+    /// `tmpRnd.setSeed(wx * wxRnd ^ wy * wyRnd ^ this.seed)`: wx and wy widen to long for the wrapping
+    /// products, the xor chain runs left to right, and the int seed widens for the final xor.
+    pub fn get_random_with_offset(&self, wx: i32, wy: i32, offset: i64) -> java::Random {
+        let mut tmp_rnd = java::Random::new(i64::from(self.seed).wrapping_add(offset));
+        let wx_rnd = tmp_rnd.next_long();
+        let wy_rnd = tmp_rnd.next_long();
+        tmp_rnd.set_seed(
+            (i64::from(wx).wrapping_mul(wx_rnd) ^ i64::from(wy).wrapping_mul(wy_rnd))
+                ^ i64::from(self.seed),
+        );
+        tmp_rnd
+    }
+
     /// zombie.iso.worldgen.WorldGenParams.load over the bytes of `map_worldgen.bin`: magic, world version, seed text,
     /// cell bounds. The original logs a broken file and keeps the fields it had set; this returns them the same way
     /// along with the error.

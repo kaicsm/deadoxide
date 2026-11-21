@@ -1,8 +1,13 @@
 //! zombie.iso.worldgen.WorldGenReader: the Lua tables under `worldgen` (the game's own
 //! `media/lua/server/WorldGen/*.lua`) into the biome registry's inputs - loadBiomes with its parent merge,
-//! loadSelection, loadPriorities. The roads, veins, static modules and biome map parsers are not ported yet.
+//! loadSelection, loadPriorities. The roads, veins, static modules, animals paths and biome map parsers
+//! are ported as well: loadStaticModules, loadVeinsConfig, loadRoadConfig, loadAnimalsPath,
+//! loadBiomeMapConfig.
 
-use crate::java::{self, JavaHashMap};
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use crate::java::{self, JavaHashMap, JavaIntHashMap};
 use crate::se::krka::kahlua::j2se::kahlua_table_impl::KahluaTableImpl;
 use crate::se::krka::kahlua::vm::object::{cast_string, rstr, Object, TableRef, Throwable, R};
 use crate::zombie::sandbox_options::SandboxOptions;
@@ -17,6 +22,12 @@ use super::biomes::feature_type::FeatureType;
 use super::biomes::grass::Grass;
 use super::biomes::probability::Probability;
 use super::biomes::tile_group::TileGroup;
+use super::maps::biome_map_entry::BiomeMapEntry;
+use super::prefab_structure::PrefabStructure;
+use super::roads::road_config::RoadConfig;
+use super::static_module::StaticModule;
+use super::veins::ore_vein_config::OreVeinConfig;
+use super::zones::animals_path_config::AnimalsPathConfig;
 
 /// `(KahluaTableImpl) value`: a table, else the ClassCastException.
 fn cast_table(o: &Object) -> R<TableRef> {
@@ -55,6 +66,38 @@ fn cast_str(o: &Object) -> R<Option<String>> {
     Ok(cast_string(o)?.map(|s| rstr(&s)))
 }
 
+/// `((Double) key).intValue() - 1` (loadPrefab's dimensions and schematic rows): the 1-based Lua array key
+/// as a 0-based index, the ClassCastException for a key that is not a Double.
+fn double_key_index(key: &Object) -> R<i32> {
+    match key {
+        Object::Number(d) => Ok(*d as i32 - 1),
+        o => Err(Throwable::class_cast(o, "java.lang.Double")),
+    }
+}
+
+/// The ArrayIndexOutOfBoundsException of an array store past an array's end.
+fn aioobe(index: i32, length: i32) -> Throwable {
+    Throwable::Java {
+        class: "java.lang.ArrayIndexOutOfBoundsException",
+        message: Some(format!("Index {index} out of bounds for length {length}")),
+    }
+}
+
+/// `new int[size]` with a negative size: the NegativeArraySizeException, its message the size.
+fn negative_array_size(size: i32) -> Throwable {
+    Throwable::Java {
+        class: "java.lang.NegativeArraySizeException",
+        message: Some(size.to_string()),
+    }
+}
+
+/// `((KahluaTable) feature.rawget("f")).rawget("main")` of loadVeinsConfig/loadRoadConfig: a missing `f`
+/// or `main` table is the NPE of the rawget on a null table, a non-table the ClassCastException.
+fn feature_main(feature_table: &TableRef) -> R<TableRef> {
+    let f = rawget_table_or_npe(feature_table, "f")?;
+    rawget_table_or_npe(&f, "main")
+}
+
 /// zombie.iso.worldgen.WorldGenReader. Stateless in the original; the port carries the sandbox options
 /// `ProbaString` reads (the original reads the `SandboxOptions.instance` static at parse time).
 pub struct WorldGenReader<'a> {
@@ -64,11 +107,10 @@ pub struct WorldGenReader<'a> {
 impl WorldGenReader<'_> {
     /// WorldGenReader.loadBiomes(KahluaTable, String): every biome of the table (the Kahlua iteration order
     /// into a java.util.HashMap), then the parent merge of `forEach` - each biome, in the HashMap's own
-    /// iteration order, walks to its parentless ancestor and rebuilds from the chain. The merge builds a
-    /// FRESH features and replacements map per merged biome (`new HashMap<>()`, then `putAll` of every chain
-    /// member's own map, root first, later members overriding earlier ones); the original never aliases a
-    /// member's map into the result. A biome that merges may read an already-merged parent, so the port
-    /// applies the merges in the same order it iterates the keys.
+    /// iteration order, walks to its parentless ancestor and rebuilds from the chain. The merge reuses the
+    /// root ancestor's replacements map object (`putAll` into it), so one ancestry shares one accumulating
+    /// map; the port keeps that aliasing with `Rc<RefCell<..>>`. A biome that merges may read an
+    /// already-merged parent, so the port applies the merges in the same order it iterates the keys.
     pub fn load_biomes(&self, worldgen_table: &TableRef, table_key: &str) -> R<JavaHashMap<Biome>> {
         let main_table = rawget_table_or_npe(worldgen_table, table_key)?;
         let mut biomes: JavaHashMap<Biome> = JavaHashMap::default();
@@ -109,10 +151,7 @@ impl WorldGenReader<'_> {
                 continue;
             }
             let mut features = BiomeFeatures::default();
-            // Map<String, List<Feature>> replacements = new HashMap<>(): a FRESH map per merged biome, putAll
-            // of every chain member's map in chain order (the first putAll pre-sizes the table, the later
-            // ones put one by one - JavaHashMap::put_all models both)
-            let mut replacements: JavaHashMap<Vec<Feature>> = JavaHashMap::default();
+            let replacements = chain[0].replacements.clone();
             let mut landscape = chain[0].landscape.clone();
             let mut plant = chain[0].plant.clone();
             let mut bush = chain[0].bush.clone();
@@ -133,8 +172,19 @@ impl WorldGenReader<'_> {
                     }
                 }
                 if let Some(biome_replacements) = &biomex.replacements {
-                    // replacements.putAll(biomeReplacements)
-                    replacements.put_all(biome_replacements);
+                    // replacements.putAll(biomeReplacements): into the shared root map when the root has
+                    // one, the NPE the original throws when it does not
+                    let Some(target) = &replacements else {
+                        return Err(Throwable::npe("replacements putAll of a null map"));
+                    };
+                    let entries: Vec<(String, Vec<Feature>)> = biome_replacements
+                        .borrow()
+                        .iter()
+                        .map(|(rk, rv)| (rk.to_string(), rv.clone()))
+                        .collect();
+                    for (rk, rv) in entries {
+                        target.borrow_mut().put(rk, rv);
+                    }
                 }
                 if !biomex.landscape.is_all_of() {
                     landscape = biomex.landscape.clone();
@@ -175,7 +225,7 @@ impl WorldGenReader<'_> {
                 v.parent.clone(),
                 v.generate,
                 Some(features),
-                Some(replacements),
+                replacements,
                 Some(landscape),
                 Some(plant),
                 Some(bush),
@@ -458,7 +508,7 @@ impl WorldGenReader<'_> {
     fn load_replacements(
         &self,
         replacements_table: Option<TableRef>,
-    ) -> R<Option<JavaHashMap<Vec<Feature>>>> {
+    ) -> R<Option<super::biomes::biome::SharedReplacements>> {
         let mut replacements: JavaHashMap<Vec<Feature>> = JavaHashMap::default();
         if let Some(replacements_table) = replacements_table {
             for (key, value) in KahluaTableImpl::iterate_snapshot(&replacements_table) {
@@ -473,7 +523,7 @@ impl WorldGenReader<'_> {
                 replacements.put(key_name, features);
             }
         }
-        Ok(Some(replacements))
+        Ok(Some(Rc::new(RefCell::new(replacements))))
     }
 
     /// WorldGenReader.loadPlacements(KahluaTable): the tiles each feature type may sit on - GENERIC first,
@@ -567,12 +617,369 @@ impl WorldGenReader<'_> {
         }
     }
 
+    /// WorldGenReader.loadStaticModules(KahluaTable, String): the `worldgen.static_modules` placements
+    /// (WorldGenChunk asks with "static_modules") - each entry a biome and/or a prefab structure inside a
+    /// map-pixel rectangle; a missing table is the empty list.
+    pub fn load_static_modules(
+        &self,
+        worldgen_table: &TableRef,
+        table_key: &str,
+    ) -> R<Vec<StaticModule>> {
+        let Some(main_table) =
+            cast_table_opt(&KahluaTableImpl::rawget(worldgen_table, &Object::str(table_key))?)?
+        else {
+            return Ok(Vec::new());
+        };
+        let mut static_modules = Vec::new();
+        for (_, module_value) in KahluaTableImpl::iterate_snapshot(&main_table) {
+            let static_module_table = cast_table(&module_value)?;
+            // (KahluaTable) rawget("position"), then positionTable.rawget(..): a missing table is the
+            // NPE, a non-table the ClassCastException
+            let position_table = rawget_table_or_npe(&static_module_table, "position")?;
+            // the defaults are -/+Double.MAX_VALUE, then Double.intValue() - the saturating narrowing
+            // cast, so they land on Integer.MIN_VALUE / Integer.MAX_VALUE
+            let xmin = self.load_double(
+                &KahluaTableImpl::rawget(&position_table, &Object::str("xmin"))?,
+                -f64::MAX,
+            )? as i32;
+            let xmax = self.load_double(
+                &KahluaTableImpl::rawget(&position_table, &Object::str("xmax"))?,
+                f64::MAX,
+            )? as i32;
+            let ymin = self.load_double(
+                &KahluaTableImpl::rawget(&position_table, &Object::str("ymin"))?,
+                -f64::MAX,
+            )? as i32;
+            let ymax = self.load_double(
+                &KahluaTableImpl::rawget(&position_table, &Object::str("ymax"))?,
+                f64::MAX,
+            )? as i32;
+            // loadBiome("", rawget("biome")): a nil table is the null the original's loadBiome answers
+            // with
+            let biome = match cast_table_opt(&KahluaTableImpl::rawget(
+                &static_module_table,
+                &Object::str("biome"),
+            )?)? {
+                Some(biome_table) => Some(self.load_biome("", &biome_table)?),
+                None => None,
+            };
+            let prefab = self.load_prefab(cast_table_opt(&KahluaTableImpl::rawget(
+                &static_module_table,
+                &Object::str("prefab"),
+            )?)?)?;
+            if biome.is_none() && prefab.is_none() {
+                return Err(Throwable::runtime(
+                    "Need at least one of 'biome' or 'prefab' in WorldGenOverride.lua/worlgen.static_modules",
+                ));
+            }
+            static_modules.push(StaticModule::new(biome, prefab, xmin, xmax, ymin, ymax));
+        }
+        Ok(static_modules)
+    }
+
+    /// WorldGenReader.loadPrefab(KahluaTable): a static module's `prefab` table; `Ok(None)` is the null
+    /// the original answers a missing table with.
+    ///
+    /// The schematic's `int[][]` is a `Vec<Vec<i32>>` per category: `new int[dimensions[1]][dimensions[0]]`
+    /// allocates every row zero-filled (a row the Lua does not mention is zeros, not null - only
+    /// `new int[n][]` would leave null rows), and a mentioned row is replaced whole by the ints of its
+    /// comma-split string, of any length, so rows can be ragged. The original's `loadList` keeps the tiles
+    /// untyped (the `(String)` cast waits until `PrefabStructure.getTile`); the port's list casts while
+    /// loading - the same ClassCastException, thrown a little earlier.
+    fn load_prefab(&self, prefab_table: Option<TableRef>) -> R<Option<PrefabStructure>> {
+        let Some(prefab_table) = prefab_table else {
+            return Ok(None);
+        };
+        // (KahluaTable) rawget("dimensions"), then dimensionTable.iterator(): a missing table is the NPE
+        let dimension_table = rawget_table_or_npe(&prefab_table, "dimensions")?;
+        let mut dimensions = [0; 2];
+        for (dim_key, dim_value) in KahluaTableImpl::iterate_snapshot(&dimension_table) {
+            let i = double_key_index(&dim_key)?;
+            // dimensions[i] = ..: the store's bounds check runs before the right-hand side (JLS 15.26.1)
+            if !(0..2).contains(&i) {
+                return Err(aioobe(i, 2));
+            }
+            let value = match dim_value {
+                Object::Number(d) => d as i32,
+                o => return Err(Throwable::class_cast(&o, "java.lang.Double")),
+            };
+            dimensions[i as usize] = value;
+        }
+        let tiles = Self::load_list_strings(cast_table_opt(&KahluaTableImpl::rawget(
+            &prefab_table,
+            &Object::str("tiles"),
+        )?)?)?;
+        // (KahluaTable) rawget("schematic"), then schematicTable.iterator(): a missing table is the NPE
+        let schematic_table = rawget_table_or_npe(&prefab_table, "schematic")?;
+        let mut schematic: JavaHashMap<Vec<Vec<i32>>> = JavaHashMap::default();
+        for (schem_key, schem_value) in KahluaTableImpl::iterate_snapshot(&schematic_table) {
+            let key = cast_str(&schem_key)?
+                .ok_or_else(|| Throwable::class_cast(&schem_key, "java.lang.String"))?;
+            let value_table = cast_table(&schem_value)?;
+            // new int[dimensions[1]][dimensions[0]]: the outer array first, then each row - a negative
+            // dimension is the NegativeArraySizeException of its allocation (per schematic entry, as the
+            // original allocates inside the loop)
+            if dimensions[1] < 0 {
+                return Err(negative_array_size(dimensions[1]));
+            }
+            if dimensions[0] < 0 {
+                return Err(negative_array_size(dimensions[0]));
+            }
+            let mut sub_schem = vec![vec![0; dimensions[0] as usize]; dimensions[1] as usize];
+            for (row_key, row_value) in KahluaTableImpl::iterate_snapshot(&value_table) {
+                let i = double_key_index(&row_key)?;
+                // subSchem[i] = ..: the store's bounds check runs before the row parses (JLS 15.26.1)
+                if i < 0 || i >= dimensions[1] {
+                    return Err(aioobe(i, dimensions[1]));
+                }
+                // ((String) value).split(","): a nil row passes the cast and NPEs at the split
+                let row_str = cast_str(&row_value)?
+                    .ok_or_else(|| Throwable::npe("schematic row is null"))?;
+                let mut row = Vec::new();
+                for part in java::split_char(&row_str, ',') {
+                    // Integer.parseInt of each part
+                    let value = java::parse_int(part).ok_or_else(|| Throwable::Java {
+                        class: "java.lang.NumberFormatException",
+                        message: Some(java::number_format_message(part)),
+                    })?;
+                    row.push(value);
+                }
+                sub_schem[i as usize] = row;
+            }
+            schematic.put(key, sub_schem);
+        }
+        let zombies = self.load_double(
+            &KahluaTableImpl::rawget(&prefab_table, &Object::str("zombies"))?,
+            0.0,
+        )? as f32;
+        Ok(Some(PrefabStructure::new(
+            dimensions,
+            tiles,
+            schematic,
+            zombies,
+        )))
+    }
+
+    /// WorldGenReader.loadVeinsConfig(KahluaTable, String): the `worldgen.veins` ore vein parameters
+    /// (WorldGenChunk asks with "veins"), keyed by the vein's name; a missing table is the empty map.
+    pub fn load_veins_config(
+        &self,
+        worldgen_table: &TableRef,
+        table_key: &str,
+    ) -> R<JavaHashMap<OreVeinConfig>> {
+        let Some(main_table) =
+            cast_table_opt(&KahluaTableImpl::rawget(worldgen_table, &Object::str(table_key))?)?
+        else {
+            return Ok(JavaHashMap::default());
+        };
+        let mut configs: JavaHashMap<OreVeinConfig> = JavaHashMap::default();
+        for (entry_key, entry_value) in KahluaTableImpl::iterate_snapshot(&main_table) {
+            let key = cast_str(&entry_key)?
+                .ok_or_else(|| Throwable::class_cast(&entry_key, "java.lang.String"))?;
+            let sub_table = cast_table(&entry_value)?;
+            let feature_table = rawget_table_or_npe(&sub_table, "feature")?;
+            let main = feature_main(&feature_table)?;
+            let tiles = self.load_features(&main)?;
+            let arms_table = rawget_table_or_npe(&sub_table, "arms")?;
+            let arms_amount_min = self.load_integer(
+                &KahluaTableImpl::rawget(&arms_table, &Object::str("amount_min"))?,
+                3,
+            )?;
+            let arms_amount_max = self.load_integer(
+                &KahluaTableImpl::rawget(&arms_table, &Object::str("amount_max"))?,
+                6,
+            )?;
+            let arms_dist_min = self.load_integer(
+                &KahluaTableImpl::rawget(&arms_table, &Object::str("distance_min"))?,
+                100,
+            )?;
+            let arms_dist_max = self.load_integer(
+                &KahluaTableImpl::rawget(&arms_table, &Object::str("distance_max"))?,
+                400,
+            )?;
+            let arms_delta_angle = self.load_integer(
+                &KahluaTableImpl::rawget(&arms_table, &Object::str("delta_angle"))?,
+                5,
+            )?;
+            let arms_prob = self.load_double(
+                &KahluaTableImpl::rawget(&arms_table, &Object::str("p"))?,
+                0.25,
+            )? as f32;
+            let center_table = rawget_table_or_npe(&sub_table, "center")?;
+            let center_radius = self.load_integer(
+                &KahluaTableImpl::rawget(&center_table, &Object::str("radius"))?,
+                5,
+            )?;
+            let center_prob = self.load_double(
+                &KahluaTableImpl::rawget(&center_table, &Object::str("p"))?,
+                0.5,
+            )? as f32;
+            let probability = self.load_double(
+                &KahluaTableImpl::rawget(&sub_table, &Object::str("p"))?,
+                0.01,
+            )? as f32;
+            configs.put(
+                key,
+                OreVeinConfig::new(
+                    tiles,
+                    center_radius,
+                    center_prob,
+                    arms_amount_min,
+                    arms_amount_max,
+                    arms_dist_min,
+                    arms_dist_max,
+                    arms_delta_angle,
+                    arms_prob,
+                    probability,
+                ),
+            );
+        }
+        Ok(configs)
+    }
+
+    /// WorldGenReader.loadRoadConfig(KahluaTable, String): the `worldgen.roads` road parameters
+    /// (WorldGenChunk asks with "roads"), keyed by the entry's name; a missing table is the empty map.
+    pub fn load_road_config(
+        &self,
+        worldgen_table: &TableRef,
+        table_key: &str,
+    ) -> R<JavaHashMap<RoadConfig>> {
+        let Some(main_table) =
+            cast_table_opt(&KahluaTableImpl::rawget(worldgen_table, &Object::str(table_key))?)?
+        else {
+            return Ok(JavaHashMap::default());
+        };
+        let mut configs: JavaHashMap<RoadConfig> = JavaHashMap::default();
+        for (entry_key, entry_value) in KahluaTableImpl::iterate_snapshot(&main_table) {
+            let key = cast_str(&entry_key)?
+                .ok_or_else(|| Throwable::class_cast(&entry_key, "java.lang.String"))?;
+            let sub_table = cast_table(&entry_value)?;
+            let feature_table = rawget_table_or_npe(&sub_table, "feature")?;
+            let main = feature_main(&feature_table)?;
+            let tiles = self.load_features(&main)?;
+            let proba_roads = self.load_double(
+                &KahluaTableImpl::rawget(&feature_table, &Object::str("p"))?,
+                1.0,
+            )?;
+            let filter = self.load_double(
+                &KahluaTableImpl::rawget(&sub_table, &Object::str("filter_edge"))?,
+                5.0E8,
+            )?;
+            let probability = self.load_double(
+                &KahluaTableImpl::rawget(&sub_table, &Object::str("p"))?,
+                5.0E-4,
+            )?;
+            configs.put(key, RoadConfig::new(tiles, proba_roads, probability, filter));
+        }
+        Ok(configs)
+    }
+
+    /// WorldGenReader.loadAnimalsPath(KahluaTable): the `animals_path_config` global (ZoneGenerator passes
+    /// the table; the original has no null check - a null NPEs at iterator(), the port takes the
+    /// reference). The animal name key is read but unused, as in the original. An entry without an
+    /// `animal` string is skipped, but only after its numbers are read - the Double-to-int conversions run
+    /// before the null check, so malformed points/radius/extension still error. The original's `loadList`
+    /// defers the element cast to the stream's `Double::intValue`; the port's list casts while loading -
+    /// the same ClassCastException, thrown a little earlier.
+    pub fn load_animals_path(&self, animals_path_table: &TableRef) -> R<Vec<AnimalsPathConfig>> {
+        let mut animals_path_config = Vec::new();
+        for (_, entry_value) in KahluaTableImpl::iterate_snapshot(animals_path_table) {
+            let sub_table = cast_table(&entry_value)?;
+            let animal_obj = KahluaTableImpl::rawget(&sub_table, &Object::str("animal"))?;
+            let count_obj = KahluaTableImpl::rawget(&sub_table, &Object::str("count"))?;
+            let chance_obj = KahluaTableImpl::rawget(&sub_table, &Object::str("chance"))?;
+            let points_obj = KahluaTableImpl::rawget(&sub_table, &Object::str("points"))?;
+            let radius_obj = KahluaTableImpl::rawget(&sub_table, &Object::str("radius"))?;
+            let extension_obj = KahluaTableImpl::rawget(&sub_table, &Object::str("extension"))?;
+            let extension_chance_obj =
+                KahluaTableImpl::rawget(&sub_table, &Object::str("extension_chance"))?;
+            let animal = self.load_string(&animal_obj, None)?;
+            let count = self.load_integer(&count_obj, 1)?;
+            let chance = self.load_double(&chance_obj, 0.0)?;
+            // obj instanceof KahluaTable table ? loadList(table) : List.of(loadDouble(obj, -1.0)): a
+            // table's values as Doubles, anything else the one (default) number
+            let points_double = match &points_obj {
+                Object::Table(t) => Self::load_list_doubles(Some(t.clone()))?,
+                o => vec![self.load_double(o, -1.0)?],
+            };
+            let radius_double = match &radius_obj {
+                Object::Table(t) => Self::load_list_doubles(Some(t.clone()))?,
+                o => vec![self.load_double(o, -1.0)?],
+            };
+            let extension_double = match &extension_obj {
+                Object::Table(t) => Self::load_list_doubles(Some(t.clone()))?,
+                o => vec![self.load_double(o, -1.0)?],
+            };
+            let extension_chance = self.load_double(&extension_chance_obj, 1.0)?;
+            // mapToInt(Double::intValue): the saturating narrowing cast, each list before the check below
+            let points: Vec<i32> = points_double.iter().map(|d| *d as i32).collect();
+            let radius: Vec<i32> = radius_double.iter().map(|d| *d as i32).collect();
+            let extension: Vec<i32> = extension_double.iter().map(|d| *d as i32).collect();
+            if let Some(animal) = animal {
+                animals_path_config.push(AnimalsPathConfig::new(
+                    animal,
+                    count,
+                    chance as f32,
+                    points,
+                    radius,
+                    extension,
+                    extension_chance as f32,
+                ));
+            }
+        }
+        Ok(animals_path_config)
+    }
+
+    /// WorldGenReader.loadBiomeMapConfig(KahluaTable): the `biome_map_config` global's pixel colours (the
+    /// value tables; the keys are unused) - `put` by pixel, so of two entries sharing a pixel the later
+    /// wins. Like loadAnimalsPath the original has no null check; the port takes the reference.
+    pub fn load_biome_map_config(
+        &self,
+        biome_map_table: &TableRef,
+    ) -> R<JavaIntHashMap<BiomeMapEntry>> {
+        let mut biome_map: JavaIntHashMap<BiomeMapEntry> = JavaIntHashMap::default();
+        for (_, entry_value) in KahluaTableImpl::iterate_snapshot(biome_map_table) {
+            let sub_table = cast_table(&entry_value)?;
+            let pixel = self.load_integer(
+                &KahluaTableImpl::rawget(&sub_table, &Object::str("pixel"))?,
+                0,
+            )?;
+            let biome =
+                self.load_string(&KahluaTableImpl::rawget(&sub_table, &Object::str("biome"))?, None)?;
+            let ore =
+                self.load_string(&KahluaTableImpl::rawget(&sub_table, &Object::str("ore"))?, None)?;
+            let zone =
+                self.load_string(&KahluaTableImpl::rawget(&sub_table, &Object::str("zone"))?, None)?;
+            biome_map.put(pixel, BiomeMapEntry::new(pixel, biome, ore, zone));
+        }
+        Ok(biome_map)
+    }
+
+    /// WorldGenReader.loadInteger(Object, int): the default for null, else `((Double) object).intValue()`
+    /// (the saturating narrowing cast).
+    fn load_integer(&self, object: &Object, default_value: i32) -> R<i32> {
+        match object {
+            Object::Nil => Ok(default_value),
+            Object::Number(d) => Ok(*d as i32),
+            o => Err(Throwable::class_cast(o, "java.lang.Double")),
+        }
+    }
+
     /// WorldGenReader.loadDouble(Object, Double).
     fn load_double(&self, object: &Object, default_value: f64) -> R<f64> {
         match object {
             Object::Nil => Ok(default_value),
             Object::Number(d) => Ok(*d),
             o => Err(Throwable::class_cast(o, "java.lang.Double")),
+        }
+    }
+
+    /// WorldGenReader.loadString(Object, String): the default for null, else the `(String)` cast (nil is
+    /// null, a non-string the ClassCastException).
+    fn load_string(&self, object: &Object, default_value: Option<String>) -> R<Option<String>> {
+        match object {
+            Object::Nil => Ok(default_value),
+            o => cast_str(o),
         }
     }
 

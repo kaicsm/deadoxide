@@ -1,5 +1,8 @@
 //! zombie.iso.worldgen.biomes.Biome / BiomeAbstract: one biome as WorldGenReader loads it.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use crate::java::JavaHashMap;
 
 use super::biome_type::{Bush, EnumSet, Hygrometry, Landscape, OreLevel, Plant, Temperature};
@@ -8,6 +11,10 @@ use super::feature_type::FeatureType;
 use super::grass::Grass;
 use super::probability::Probability;
 use super::tile_group::TileGroup;
+
+/// `Map<String, List<Feature>>` of the biome's tile replacements, shared through the parent merge (see
+/// WorldGenReader.loadBiomes: the merge `putAll`s into the root ancestor's map object).
+pub type SharedReplacements = Rc<RefCell<JavaHashMap<Vec<Feature>>>>;
 
 /// `Map<FeatureType, List<Feature>>`: a slot per type, present only when the Lua (or the parent merge) put it.
 /// The original's HashMap is only ever read by `get(type)` and filled per type, so the port keeps the five
@@ -105,17 +112,16 @@ impl SubBiomes {
 
 /// zombie.iso.worldgen.biomes.Biome, the fields of BiomeAbstract plus the two the subclass owns. A `None`
 /// feature set, placements or grass is the original's null; the six EnumSets always have a value (the
-/// constructor keeps the allOf default when the reader passes null). `replacements` is null only for
-/// DEFAULT_BIOME: loadReplacements always builds a map, and the parent merge of WorldGenReader.loadBiomes
-/// builds every merged biome its own FRESH map (`putAll` of each chain member, root first) - the original
-/// never aliases one biome's map into another.
+/// constructor keeps the allOf default when the reader passes null). `replacements` is shared: the parent
+/// merge of WorldGenReader.loadBiomes reuses the root ancestor's map object and `putAll`s into it, so every
+/// merged biome of one ancestry observes the same, accumulating map - the port keeps that aliasing.
 #[derive(Clone, Debug)]
 pub struct Biome {
     pub name: String,
     pub parent: Option<String>,
     pub generate: bool,
     pub features: Option<BiomeFeatures>,
-    pub replacements: Option<JavaHashMap<Vec<Feature>>>,
+    pub replacements: Option<SharedReplacements>,
     pub landscape: EnumSet<Landscape>,
     pub plant: EnumSet<Plant>,
     pub bush: EnumSet<Bush>,
@@ -138,7 +144,7 @@ impl Biome {
         parent: Option<String>,
         generate: bool,
         features: Option<BiomeFeatures>,
-        replacements: Option<JavaHashMap<Vec<Feature>>>,
+        replacements: Option<SharedReplacements>,
         landscape: Option<EnumSet<Landscape>>,
         plant: Option<EnumSet<Plant>>,
         bush: Option<EnumSet<Bush>>,

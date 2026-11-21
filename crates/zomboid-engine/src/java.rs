@@ -213,14 +213,121 @@ pub fn hash_map_order_from(
     order
 }
 
+/// `hash_map_order` for a `java.util.HashMap<Integer, _>`: `Integer.hashCode()` is the int value itself, the rest
+/// of the bucket math identical (spread `h ^ h >>> 16`, table growth at size > capacity * 0.75).
+pub fn int_hash_map_order(keys_in_insertion_order: &[i32]) -> Vec<usize> {
+    int_hash_map_order_from(keys_in_insertion_order, 16)
+}
+
+/// `int_hash_map_order` for a table that started at `initial_capacity` buckets (a power of two).
+pub fn int_hash_map_order_from(keys_in_insertion_order: &[i32], initial_capacity: usize) -> Vec<usize> {
+    let mut seen = std::collections::HashSet::new();
+    let unique: Vec<usize> = (0..keys_in_insertion_order.len())
+        .filter(|i| seen.insert(keys_in_insertion_order[*i]))
+        .collect();
+    let mut cap: usize = initial_capacity;
+    while unique.len() as f64 > cap as f64 * 0.75 {
+        cap *= 2;
+    }
+    let bucket = |i: usize| {
+        let h = keys_in_insertion_order[i];
+        ((h ^ ((h as u32) >> 16) as i32) as u32 as usize) & (cap - 1)
+    };
+    let mut order = unique;
+    order.sort_by_key(|i| bucket(*i)); // stable: insertion order within a bucket
+    order
+}
+
+/// java.util.HashMap<Integer, V> filled by `put` only (no removals): `get`, `len`, and iteration in Java's order (see
+/// `int_hash_map_order`; a `put` over an existing key keeps its position).
+#[derive(Clone, Debug)]
+pub struct JavaIntHashMap<V> {
+    keys: Vec<i32>,
+    values: Vec<V>,
+    /// Buckets the table starts with: 16, or a copy constructor's size.
+    initial_capacity: usize,
+}
+
+impl<V> Default for JavaIntHashMap<V> {
+    fn default() -> Self {
+        JavaIntHashMap {
+            keys: Vec::new(),
+            values: Vec::new(),
+            initial_capacity: 16,
+        }
+    }
+}
+
+impl<V> JavaIntHashMap<V> {
+    /// java.util.HashMap.put: the previous value of the key, replaced in place.
+    pub fn put(&mut self, key: i32, value: V) -> Option<V> {
+        match self.keys.iter().position(|k| *k == key) {
+            Some(i) => Some(std::mem::replace(&mut self.values[i], value)),
+            None => {
+                self.keys.push(key);
+                self.values.push(value);
+                None
+            }
+        }
+    }
+
+    /// java.util.HashMap.get
+    pub fn get(&self, key: i32) -> Option<&V> {
+        self.keys
+            .iter()
+            .position(|k| *k == key)
+            .map(|i| &self.values[i])
+    }
+
+    /// java.util.HashMap.size
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// java.util.HashMap.isEmpty
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// java.util.HashMap.values(), in the map's iteration order.
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.iter().map(|(_, v)| v)
+    }
+
+    /// java.util.HashMap.entrySet() order: the entries in the map's iteration order.
+    pub fn iter(&self) -> impl Iterator<Item = (i32, &V)> {
+        int_hash_map_order_from(&self.keys, self.initial_capacity)
+            .into_iter()
+            .map(move |i| (self.keys[i], &self.values[i]))
+    }
+
+    /// java.util.HashMap.containsKey
+    pub fn contains_key(&self, key: i32) -> bool {
+        self.keys.iter().any(|k| *k == key)
+    }
+
+    /// java.util.HashMap.getOrDefault
+    pub fn get_or_default(&self, key: i32, default: V) -> V
+    where
+        V: Clone,
+    {
+        self.get(key).cloned().unwrap_or(default)
+    }
+
+    /// java.util.HashMap.clear
+    pub fn clear(&mut self) {
+        self.keys.clear();
+        self.values.clear();
+    }
+}
+
 /// java.util.HashMap<String, V> filled by `put` only (no removals): `get`, `len`, and iteration in Java's order (see
 /// `hash_map_order`; a `put` over an existing key keeps its position).
 #[derive(Clone, Debug)]
 pub struct JavaHashMap<V> {
     keys: Vec<String>,
     values: Vec<V>,
-    /// Buckets the table starts with: 16 for `new HashMap()`, or the pre-sized `tableSizeFor` of the copy
-    /// constructor / a first `putAll` into the still-unallocated table (see `put_all`).
+    /// Buckets the table starts with: 16, or the copy constructor's `tableSizeFor(size / 0.75 + 1)`.
     initial_capacity: usize,
 }
 
@@ -244,26 +351,6 @@ impl<V> JavaHashMap<V> {
                 self.values.push(value);
                 None
             }
-        }
-    }
-
-    /// java.util.HashMap.putAll (the JDK's `putMapEntries`, measured on JDK 21): into a map whose table is
-    /// still unallocated (nothing put yet) the table PRE-SIZES to `tableSizeFor((int)Math.ceil(size / 0.75f))`
-    /// before the first entry lands - the `HashMap(Map)` constructor takes the same path - so a small first
-    /// source iterates in another order than the same entries put one by one into `new HashMap()` (a 3-entry
-    /// putAll starts at 4 buckets, not 16). Into an already-allocated table the source's entries are put one
-    /// by one in the source's iteration order; the upfront `while (s > threshold) resize()` doublings reach
-    /// exactly the capacity the per-put resizes would, so only the first `putAll` needs the special case.
-    pub fn put_all(&mut self, source: &JavaHashMap<V>)
-    where
-        V: Clone,
-    {
-        if self.keys.is_empty() && !source.keys.is_empty() {
-            let t = (source.keys.len() as f64 / 0.75).ceil() as usize;
-            self.initial_capacity = t.next_power_of_two();
-        }
-        for (k, v) in source.iter() {
-            self.put(k.to_string(), v.clone());
         }
     }
 
