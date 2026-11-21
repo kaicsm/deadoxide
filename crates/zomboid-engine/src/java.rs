@@ -219,7 +219,8 @@ pub fn hash_map_order_from(
 pub struct JavaHashMap<V> {
     keys: Vec<String>,
     values: Vec<V>,
-    /// Buckets the table starts with: 16, or the copy constructor's `tableSizeFor(size / 0.75 + 1)`.
+    /// Buckets the table starts with: 16 for `new HashMap()`, or the pre-sized `tableSizeFor` of the copy
+    /// constructor / a first `putAll` into the still-unallocated table (see `put_all`).
     initial_capacity: usize,
 }
 
@@ -243,6 +244,26 @@ impl<V> JavaHashMap<V> {
                 self.values.push(value);
                 None
             }
+        }
+    }
+
+    /// java.util.HashMap.putAll (the JDK's `putMapEntries`, measured on JDK 21): into a map whose table is
+    /// still unallocated (nothing put yet) the table PRE-SIZES to `tableSizeFor((int)Math.ceil(size / 0.75f))`
+    /// before the first entry lands - the `HashMap(Map)` constructor takes the same path - so a small first
+    /// source iterates in another order than the same entries put one by one into `new HashMap()` (a 3-entry
+    /// putAll starts at 4 buckets, not 16). Into an already-allocated table the source's entries are put one
+    /// by one in the source's iteration order; the upfront `while (s > threshold) resize()` doublings reach
+    /// exactly the capacity the per-put resizes would, so only the first `putAll` needs the special case.
+    pub fn put_all(&mut self, source: &JavaHashMap<V>)
+    where
+        V: Clone,
+    {
+        if self.keys.is_empty() && !source.keys.is_empty() {
+            let t = (source.keys.len() as f64 / 0.75).ceil() as usize;
+            self.initial_capacity = t.next_power_of_two();
+        }
+        for (k, v) in source.iter() {
+            self.put(k.to_string(), v.clone());
         }
     }
 

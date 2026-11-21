@@ -136,6 +136,7 @@ fn main() {
         Some("javachars") if a.len() == 3 => javachars(),
         Some("fdlibm") if a.len() == 3 => fdlibm(),
         Some("wgsimplex") if a.len() == 3 => wgsimplex(),
+        Some("wgbiomes") if a.len() == 4 => wgbiomes(Path::new(&a[2]), &a[3]),
         Some("luaload" | "luaserver" | "luaclient") if a.len() >= 4 => {
             luaload(Path::new(&a[2]), &a[3], &a[4..], false)
         }
@@ -12023,6 +12024,385 @@ pub fn wgsimplex() -> Result<String, String> {
                     java::double_to_string(y),
                     java::double_to_string(g.selector(x, y))
                 );
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `tests/original_probe/WorldGenBiomesProbe.java` on the port: the biome registry the game's own Lua
+/// defines - the client's startup and the Lua state as the loot case builds them, LoadDirBase of shared and
+/// server (the dedicated server's Lua, where `media/lua/server/WorldGen/*.lua` fills the `worldgen` table),
+/// then WorldGenReader over it: both biome tables with every field, the six selection threshold lists, the
+/// tile priorities, and BiomeRegistry's picks over the stage-1 simplex for a grid of seeds and coordinates
+/// (the maps WorldGenChunk's constructor keeps: loadBiomes filtered by `generate`).
+pub fn wgbiomes(root: &std::path::Path, cache_dir: &str) -> Result<String, String> {
+    use std::fmt::Write as _;
+    use std::rc::Rc;
+    use zomboid_engine::java::JavaHashMap;
+    use zomboid_engine::se::krka::kahlua::j2se::kahlua_table_impl::KahluaTableImpl;
+    use zomboid_engine::se::krka::kahlua::vm::object::Object;
+    use zomboid_engine::zombie::game_window::ClientStartup;
+    use zomboid_engine::zombie::iso::worldgen::biomes::biome::Biome;
+    use zomboid_engine::zombie::iso::worldgen::biomes::biome_registry::{BiomeRegistry, Selection};
+    use zomboid_engine::zombie::iso::worldgen::biomes::biome_type::{
+        BiomeEnum, Bush, EnumSet, Hygrometry, Landscape, OreLevel, Plant, Temperature,
+    };
+    use zomboid_engine::zombie::iso::worldgen::biomes::feature::Feature;
+    use zomboid_engine::zombie::iso::worldgen::biomes::feature_type::FeatureType;
+    use zomboid_engine::zombie::iso::worldgen::biomes::probability::Probability;
+    use zomboid_engine::zombie::iso::worldgen::world_gen_reader::WorldGenReader;
+    use zomboid_engine::zombie::iso::worldgen::world_gen_simplex_generator::WorldGenSimplexGenerator;
+    use zomboid_engine::zombie::lua::exposed_methods::sandbox_options_instance;
+    use zomboid_engine::zombie::lua::lua_manager::LuaManager;
+
+    fn esc(s: &str) -> String {
+        let mut b = String::from("\"");
+        for c in s.encode_utf16() {
+            if (0x20..0x7f).contains(&c) && c != u16::from(b'"') && c != u16::from(b'\\') {
+                b.push(char::from(c as u8));
+            } else {
+                let _ = write!(b, "\\u{c:04x}");
+            }
+        }
+        b.push('"');
+        b
+    }
+    fn d_hex(d: f64) -> String {
+        format!("d{:016x}", d.to_bits())
+    }
+    fn f_hex(f: f32) -> String {
+        format!("f{:08x}", f.to_bits())
+    }
+    fn names(list: &[String]) -> String {
+        format!(
+            "[{}]",
+            list.iter().map(|s| esc(s)).collect::<Vec<_>>().join(",")
+        )
+    }
+    fn doubles(list: &[f64]) -> String {
+        format!(
+            "[{}]",
+            list.iter().map(|d| d_hex(*d)).collect::<Vec<_>>().join(",")
+        )
+    }
+    fn sets<T: BiomeEnum>(set: &EnumSet<T>) -> String {
+        format!(
+            "[{}]",
+            set.iter().map(|t| t.name()).collect::<Vec<_>>().join(",")
+        )
+    }
+    fn p_str(p: &Probability) -> String {
+        // the probe prints "P " + (ProbaString ? "s" : "") + f%08x: `s` marks the sandbox-option kind, the
+        // plain double gets NO marker of its own - the leading `f` comes from f_hex itself
+        match p {
+            Probability::Double(d) => format!("P {}", f_hex(*d as f32)),
+            Probability::Sandbox(f) => format!("P s{}", f_hex(*f)),
+        }
+    }
+    fn feature_lines(out: &mut String, features: &[Feature], f_prefix: &str, g_prefix: &str) {
+        for (i, f) in features.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "{f_prefix} {} MIN {} MAX {} {}",
+                i + 1,
+                f.min_size,
+                f.max_size,
+                p_str(&f.probability)
+            );
+            for (j, g) in f.tile_groups.iter().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "{g_prefix} {} {} {}x{} {}",
+                    i + 1,
+                    j + 1,
+                    g.sx,
+                    g.sy,
+                    names(&g.tiles)
+                );
+            }
+        }
+    }
+    // one biome's block: the same lines the probe prints, `id` the biome's name or its sub-biome path
+    fn biome_block(out: &mut String, id: &str, b: &Biome, depth: usize) {
+        let _ = writeln!(
+            out,
+            "B {id} PARENT {} GEN {} ZOMBIES {}",
+            match &b.parent {
+                Some(p) => esc(p),
+                None => "nil".to_string(),
+            },
+            i32::from(b.generate),
+            f_hex(b.zombies)
+        );
+        match &b.grass {
+            Some(g) => {
+                let _ = writeln!(
+                    out,
+                    "B {id} GRASS fern={} div={} noGrass={} grass={}",
+                    f_hex(g.fern_chance),
+                    f_hex(g.no_grass_div),
+                    doubles(&g.no_grass_stages),
+                    doubles(&g.grass_stages)
+                );
+            }
+            None => {
+                let _ = writeln!(out, "B {id} GRASS nil");
+            }
+        }
+        let _ = writeln!(
+            out,
+            "B {id} SETS landscape={} plant={} bush={} temperature={} hygrometry={} ore={}",
+            sets(&b.landscape),
+            sets(&b.plant),
+            sets(&b.bush),
+            sets(&b.temperature),
+            sets(&b.hygrometry),
+            sets(&b.ore_level)
+        );
+        match &b.features {
+            None => {
+                let _ = writeln!(out, "B {id} FEATURES nil");
+            }
+            Some(features) => {
+                let present = FeatureType::ALL
+                    .iter()
+                    .filter(|t| features.get(**t).is_some())
+                    .count();
+                let _ = writeln!(out, "B {id} FEATURES {present}");
+                for t in FeatureType::ALL {
+                    if let Some(list) = features.get(*t) {
+                        let _ = writeln!(out, "B {id} FEAT {} {}", t.name(), list.len());
+                        feature_lines(
+                            out,
+                            list,
+                            &format!("F {id} {}", t.name()),
+                            &format!("GF {id} {}", t.name()),
+                        );
+                    }
+                }
+            }
+        }
+        match &b.replacements {
+            None => {
+                let _ = writeln!(out, "B {id} REPLACEMENTS nil");
+            }
+            Some(replacements) => {
+                let _ = writeln!(out, "B {id} REPLACEMENTS {}", replacements.len());
+                for (key, features) in replacements.iter() {
+                    let _ = writeln!(out, "R {id} {} {}", esc(key), features.len());
+                    feature_lines(
+                        out,
+                        features,
+                        &format!("RF {id} {}", esc(key)),
+                        &format!("GRF {id} {}", esc(key)),
+                    );
+                }
+            }
+        }
+        match &b.placements {
+            None => {
+                let _ = writeln!(out, "B {id} PLACEMENTS nil");
+            }
+            Some(placements) => {
+                let _ = writeln!(out, "B {id} PLACEMENTS 5");
+                for t in FeatureType::ALL {
+                    let _ = writeln!(out, "PL {id} {} {}", t.name(), names(placements.get(*t)));
+                }
+            }
+        }
+        let sub_count = FeatureType::ALL
+            .iter()
+            .filter(|t| b.sub_biomes.get(**t).is_some())
+            .count();
+        let _ = writeln!(out, "B {id} SUBBIOMES {sub_count}");
+        if depth < 8 {
+            for t in FeatureType::ALL {
+                let Some(inner) = b.sub_biomes.get(*t) else {
+                    continue;
+                };
+                for st in FeatureType::ALL {
+                    let Some(list) = inner.get(*st) else {
+                        continue;
+                    };
+                    let _ = writeln!(out, "SB {id} {} {} {}", t.name(), st.name(), list.len());
+                    for (k, sub) in list.iter().enumerate() {
+                        let path = format!("{id}/{}/{}/{}", t.name(), st.name(), k + 1);
+                        let _ = writeln!(out, "BB {path} {}", esc(&sub.name));
+                        biome_block(out, &path, sub, depth + 1);
+                    }
+                }
+            }
+        }
+        let _ = writeln!(out, "B {id} PROTECTED {}", names(&b.protected_list));
+    }
+    fn dump_map(out: &mut String, header: &str, raw: &JavaHashMap<Biome>) -> JavaHashMap<Biome> {
+        let _ = writeln!(out, "{header} {}", raw.len());
+        for (name, b) in raw.iter() {
+            biome_block(out, name, b, 0);
+        }
+        // the map WorldGenChunk's constructor keeps: loadBiomes filtered by generate(), Collectors.toMap
+        // into a fresh HashMap (inserted in this map's iteration order)
+        let mut kept: JavaHashMap<Biome> = JavaHashMap::default();
+        for (name, b) in raw.iter() {
+            if b.generate {
+                kept.put(name.to_string(), b.clone());
+            }
+        }
+        let kept_names: Vec<String> = kept.iter().map(|(k, _)| k.to_string()).collect();
+        let _ = writeln!(out, "{header}GEN {} {}", kept.len(), names(&kept_names));
+        kept
+    }
+    fn selection_lines<T: BiomeEnum>(out: &mut String, sel: &Selection<T>) {
+        let _ = writeln!(out, "SEL {} {}", T::KEY, sel.iter().count());
+        for (member, list) in sel.iter() {
+            let _ = writeln!(out, "S {} {} {}", T::KEY, member.name(), doubles(list));
+        }
+    }
+
+    let startup = ClientStartup::init(root).map_err(|e| format!("startup: {e}"))?;
+    let mut lm =
+        LuaManager::init_after(root, Some(Rc::new(startup))).map_err(|e| format!("init: {e:?}"))?;
+    *lm.statics.cache_dir.borrow_mut() = Some(cache_dir.to_string());
+    zomboid_engine::zombie::lua::exposed_game::init_shared(&lm.statics)
+        .map_err(|e| format!("initShared: {e}"))?;
+    for dir in ["shared", "server"] {
+        lm.load_dir_base(dir)
+            .map_err(|e| format!("LoadDirBase {dir}: {e:?}"))?;
+    }
+    let worldgen = match KahluaTableImpl::rawget(&lm.env, &Object::str("worldgen"))
+        .map_err(|e| format!("worldgen: {e:?}"))?
+    {
+        Object::Table(t) => t,
+        Object::Nil => return Err("worldgen table missing from the Lua environment".into()),
+        o => {
+            return Err(format!(
+                "ClassCastException: worldgen is not a table: {}",
+                o.java_to_string()
+            ))
+        }
+    };
+    // SandboxOptions.instance, what ProbaString reads (resolved here; nothing between this and the parse
+    // changes the options)
+    let so = sandbox_options_instance(&lm.statics, &mut lm.thread)
+        .map_err(|e| format!("SandboxOptions.instance: {e:?}"))?;
+    let so_borrowed = so.0.borrow();
+    let reader = WorldGenReader {
+        sandbox: &so_borrowed,
+    };
+    let mut out = String::new();
+
+    // WorldGenChunk.<init>'s table keys: the _override entries when a WorldGenOverride.lua set them
+    let has_override = |key: &str| -> Result<bool, String> {
+        Ok(!KahluaTableImpl::rawget(&worldgen, &Object::str(key))
+            .map_err(|e| format!("{e:?}"))?
+            .is_nil())
+    };
+    let biomes_key = if has_override("biomes_override")? {
+        "biomes_override"
+    } else {
+        "biomes"
+    };
+    let biomes_map_key = "biomes_map"; // the constructor passes the literal key, no _override fallback
+    let selection_key = if has_override("selection_override")? {
+        "selection_override"
+    } else {
+        "selection"
+    };
+    let _ = writeln!(
+        out,
+        "KEYS biomes={biomes_key} biomes_map={biomes_map_key} selection={selection_key}"
+    );
+
+    let raw = reader
+        .load_biomes(&worldgen, biomes_key)
+        .map_err(|e| format!("loadBiomes: {e:?}"))?;
+    let biomes = dump_map(&mut out, "BIOMES", &raw);
+    let raw_map = reader
+        .load_biomes(&worldgen, biomes_map_key)
+        .map_err(|e| format!("loadBiomes(biomes_map): {e:?}"))?;
+    let biomes_map = dump_map(&mut out, "BIOMESMAP", &raw_map);
+
+    let landscape: Selection<Landscape> = reader
+        .load_selection(&worldgen, selection_key)
+        .map_err(|e| format!("loadSelection landscape: {e:?}"))?;
+    selection_lines(&mut out, &landscape);
+    let plant: Selection<Plant> = reader
+        .load_selection(&worldgen, selection_key)
+        .map_err(|e| format!("loadSelection plant: {e:?}"))?;
+    selection_lines(&mut out, &plant);
+    let bush: Selection<Bush> = reader
+        .load_selection(&worldgen, selection_key)
+        .map_err(|e| format!("loadSelection bush: {e:?}"))?;
+    selection_lines(&mut out, &bush);
+    let temperature: Selection<Temperature> = reader
+        .load_selection(&worldgen, selection_key)
+        .map_err(|e| format!("loadSelection temperature: {e:?}"))?;
+    selection_lines(&mut out, &temperature);
+    let hygrometry: Selection<Hygrometry> = reader
+        .load_selection(&worldgen, selection_key)
+        .map_err(|e| format!("loadSelection hygrometry: {e:?}"))?;
+    selection_lines(&mut out, &hygrometry);
+    let ore_level: Selection<OreLevel> = reader
+        .load_selection(&worldgen, selection_key)
+        .map_err(|e| format!("loadSelection ore_level: {e:?}"))?;
+    selection_lines(&mut out, &ore_level);
+
+    let priorities = reader
+        .load_priorities(&worldgen, "priorities")
+        .map_err(|e| format!("loadPriorities: {e:?}"))?;
+    let _ = writeln!(out, "PRIORITIES {}", priorities.len());
+    for (name, value) in priorities.iter() {
+        let _ = writeln!(out, "P {} {}", esc(name), d_hex(*value));
+    }
+
+    // BiomeRegistry, as WorldGenChunk.getBiome calls it
+    let mut registry = BiomeRegistry::default();
+    const SEEDS: [i64; 6] = [1, 42, -1, 2147483647, i64::MIN, 0x1234567890ABCDEF];
+    const CO: [i64; 8] = [0, 1, 7, 8, 63, 300, 2047, -1];
+    for seed in SEEDS {
+        let generator = WorldGenSimplexGenerator::new(seed);
+        for x in CO {
+            for y in CO {
+                let pick = registry
+                    .get(
+                        &biomes,
+                        generator.noise(x as f64, y as f64),
+                        generator.selector(x as f64, y as f64),
+                        &landscape,
+                        &plant,
+                        &bush,
+                        &temperature,
+                        &hygrometry,
+                        &ore_level,
+                    )
+                    .map_err(|e| format!("BiomeRegistry.get: {e}"))?;
+                let _ = writeln!(out, "GETBIOME {seed} {x} {y} {}", pick.name());
+            }
+        }
+    }
+    let map_filters: Vec<String> = biomes_map.iter().map(|(k, _)| k.to_string()).collect();
+    for filter in &map_filters {
+        for seed in SEEDS.iter().take(2) {
+            let generator = WorldGenSimplexGenerator::new(*seed);
+            for x in CO.iter().step_by(2) {
+                for y in CO.iter().step_by(2) {
+                    let pick = registry
+                        .get_filtered(
+                            &biomes_map,
+                            Some(filter),
+                            generator.noise(*x as f64, *y as f64),
+                            generator.selector(*x as f64, *y as f64),
+                            &bush,
+                            &ore_level,
+                        )
+                        .map_err(|e| format!("BiomeRegistry.get(filtered): {e}"))?;
+                    let name = match pick {
+                        Some(p) => p.name().to_string(),
+                        None => "null".to_string(),
+                    };
+                    let _ = writeln!(out, "GETMAPBIOME {} {seed} {x} {y} {name}", esc(filter));
+                }
             }
         }
     }

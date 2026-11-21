@@ -11,6 +11,101 @@ HERE=$(pwd)
 mkdir -p target/oracle target/original-probe tests/golden/engine
 cargo build -q --release -p zomboid-engine || exit 1
 fail=0
+# The probes rewire the original through reflection (static non-final fields like RandAbstract.rand,
+# instance finals like RoomDef.x). JDK 26+ only allows that with the launcher opt-in
+# --enable-final-field-mutation=ALL-UNNAMED; older JDKs (21, 25 - the game's own JRE) do not know the
+# option at all, and passing it aborts the JVM before main, while there the writes need no opt-in.
+# Probe the java every case runs (the PATH one; the $PZ_JRE / $PZ_JRE_X86 cases never pass the option).
+FFM=""
+if java --enable-final-field-mutation=ALL-UNNAMED -version >/dev/null 2>&1; then
+  FFM="--enable-final-field-mutation=ALL-UNNAMED"
+fi
+# The ORIGINAL game the probes' natives and bundled JREs come from. The pinned jar and media in the repo's
+# parent stay what the oracle compares against (docs/PORT.md); only the native libraries may come from
+# another - e.g. a newer Steam - install. An explicit PZ_NATIVES / PZ_JRE / PZ_JRE_X86 always wins;
+# otherwise the install is looked up once, in this order: the pinned install itself (its natives sit next
+# to the jar: the macOS bundle's Contents/Java the repo may live in, a Linux install root, a Windows
+# win64/), every Steam library (steamapps and config libraryfolders.vdf), then the standard Steam paths.
+has_natives() {
+  case "$(uname -s)" in
+    Darwin) [ -n "$(ls "$1"/*.dylib 2>/dev/null)" ] ;;
+    *) [ -n "$(ls "$1"/*.so 2>/dev/null)" ] || [ -n "$(ls "$1"/*.dll 2>/dev/null)" ] ;;
+  esac
+}
+# The natives dir of install $1, nothing (and false) if it has none: the macOS .app bundle first, then the
+# natives subfolder (the 42 Linux layout: GOG/Steam keep every library there, jre64's sibling), then the
+# install root (older Linux layouts keep the natives next to the jar; the root may also hold a lone stray
+# such as the pzexe wrapper's libpzexe_jni64.so, which must not win), then the Windows subfolders.
+natives_of() {
+  pz_dir="$1/Project Zomboid.app/Contents/Java"
+  if [ -d "$pz_dir" ] && has_natives "$pz_dir"; then echo "$pz_dir"; return 0; fi
+  if has_natives "$1/natives"; then echo "$1/natives"; return 0; fi
+  if has_natives "$1"; then echo "$1"; return 0; fi
+  for pz_dir in win64 linux64; do
+    if has_natives "$1/$pz_dir"; then echo "$1/$pz_dir"; return 0; fi
+  done
+  return 1
+}
+# Every Steam library's ProjectZomboid (one candidate per line, spaces kept - read back with IFS= read).
+steam_libraries() {
+  for pz_vdf in \
+    "$HOME/Library/Application Support/Steam/steamapps/libraryfolders.vdf" \
+    "$HOME/Library/Application Support/Steam/config/libraryfolders.vdf" \
+    "$HOME/.local/share/Steam/steamapps/libraryfolders.vdf" \
+    "$HOME/.local/share/Steam/config/libraryfolders.vdf" \
+    "$HOME/.steam/steam/steamapps/libraryfolders.vdf" \
+    "$HOME/.steam/steam/config/libraryfolders.vdf" \
+    "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/libraryfolders.vdf" \
+    "/c/Program Files (x86)/Steam/steamapps/libraryfolders.vdf" \
+    "/c/Program Files/Steam/steamapps/libraryfolders.vdf"
+  do
+    [ -f "$pz_vdf" ] && sed -n 's/^[[:space:]]*"path"[[:space:]]*"\(.*\)"[[:space:]]*$/\1\/steamapps\/common\/ProjectZomboid/p' "$pz_vdf"
+  done
+}
+PZ_INSTALL=""
+PZ_TRIED=""
+if [ -z "${PZ_NATIVES-}" ] || [ -z "${PZ_JRE-}" ] || [ -z "${PZ_JRE_X86-}" ]; then
+  pz_cands="$ROOT
+$HOME/Library/Application Support/Steam/steamapps/common/ProjectZomboid
+$HOME/.local/share/Steam/steamapps/common/ProjectZomboid
+$HOME/.steam/steam/steamapps/common/ProjectZomboid
+$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/ProjectZomboid
+/c/Program Files (x86)/Steam/steamapps/common/ProjectZomboid
+/c/Program Files/Steam/steamapps/common/ProjectZomboid
+$(steam_libraries)"
+  while IFS= read -r pz_cand; do
+    [ -n "$pz_cand" ] || continue
+    [ -d "$pz_cand" ] || continue
+    PZ_TRIED="$PZ_TRIED$pz_cand; "
+    pz_natives=$(natives_of "$pz_cand") || continue
+    PZ_INSTALL=$pz_cand
+    [ -z "${PZ_NATIVES-}" ] && PZ_NATIVES=$pz_natives
+    break
+  done <<EOF
+$pz_cands
+EOF
+  # the game's bundled JREs (jre_case / ai_case) live in the macOS .app bundle next to Java/
+  if [ -z "${PZ_JRE-}" ] || [ -z "${PZ_JRE_X86-}" ]; then
+    pz_contents=""
+    if [ -n "$PZ_INSTALL" ]; then
+      if [ -d "$PZ_INSTALL/Project Zomboid.app/Contents/PlugIns" ]; then
+        pz_contents="$PZ_INSTALL/Project Zomboid.app/Contents"
+      elif [ -n "${PZ_NATIVES-}" ] && [ -d "$(dirname "$PZ_NATIVES")/PlugIns" ]; then
+        pz_contents=$(dirname "$PZ_NATIVES")
+      fi
+    fi
+    if [ -n "$pz_contents" ]; then
+      pz_arch=$( [ "$(uname -m)" = arm64 ] && echo aarch64 || echo x86_64 )
+      [ -z "${PZ_JRE-}" ] && PZ_JRE="$pz_contents/PlugIns/jre-$pz_arch/Contents/Home/bin/java"
+      [ -z "${PZ_JRE_X86-}" ] && PZ_JRE_X86="$pz_contents/PlugIns/jre-x86_64/Contents/Home/bin/java"
+    fi
+  fi
+fi
+# A Linux install (GOG/Steam) bundles its x86-64 JRE as jre64 next to the natives dir.
+if [ -z "${PZ_JRE_X86-}" ] && [ -n "$PZ_INSTALL" ] && [ -x "$PZ_INSTALL/jre64/bin/java" ]; then
+  PZ_JRE_X86="$PZ_INSTALL/jre64/bin/java"
+  [ -z "${PZ_JRE-}" ] && [ "$(uname -m)" = x86_64 ] && PZ_JRE="$PZ_INSTALL/jre64/bin/java"
+fi
 # case <name> <ProbeClass> [probe args...]   (pz-dump gets: <name> <root> [args...])
 run_case() {
   name=$1; probe=$2; shift 2
@@ -29,10 +124,9 @@ run_case() {
 }
 # jre_case <name> <ProbeClass> [probe args...]: like run_case, on the game's own bundled JRE (the JDK library
 # behaviour the game really has: UTF-8 decoding, Double.parseDouble), the probe compiled for it.
-PZ_JRE=${PZ_JRE:-"$HOME/Library/Application Support/Steam/steamapps/common/ProjectZomboid/Project Zomboid.app/Contents/PlugIns/jre-$( [ "$(uname -m)" = arm64 ] && echo aarch64 || echo x86_64 )/Contents/Home/bin/java"}
 jre_case() {
   name=$1; probe=$2; shift 2
-  [ -x "$PZ_JRE" ] || { echo "FAIL $name: no game JRE at $PZ_JRE (set PZ_JRE)"; fail=1; return; }
+  [ -x "$PZ_JRE" ] || { echo "FAIL $name: no game JRE at ${PZ_JRE:-<none found>} (set PZ_JRE)"; fail=1; return; }
   javac -nowarn --release 25 -encoding UTF-8 -cp "$ROOT/projectzomboid.jar" -d target/original-probe-jre "tests/original_probe/$probe.java" 2>target/oracle/$name.javac \
     || { cat target/oracle/$name.javac; echo "FAIL $name (javac)"; fail=1; return; }
   (cd "$ROOT" && "$PZ_JRE" -cp "$HERE/target/original-probe-jre:projectzomboid.jar" "$probe" "$@" >"$HERE/target/oracle/$name.java.txt" 2>"$HERE/target/oracle/$name.java.err") \
@@ -48,13 +142,12 @@ jre_case() {
 }
 # server_case <name> <ProbeClass> [args...]: the probe runs INSIDE the fully booted original (ServerHarness.java): a
 # headless dedicated server from the pinned jar, natives for this OS from $PZ_NATIVES, fresh scratch cache dir, fixed seed.
-PZ_NATIVES=${PZ_NATIVES:-"$HOME/Library/Application Support/Steam/steamapps/common/ProjectZomboid/Project Zomboid.app/Contents/Java"}
 server_case() {
   name=$1; probe=$2; shift 2
-  [ -d "$PZ_NATIVES" ] || { echo "FAIL $name: no natives in $PZ_NATIVES (set PZ_NATIVES)"; fail=1; return; }
+  [ -d "$PZ_NATIVES" ] || { echo "FAIL $name: no natives in ${PZ_NATIVES:-<none found; looked at $PZ_TRIED>} (set PZ_NATIVES)"; fail=1; return; }
   javac -nowarn -encoding UTF-8 -cp "$ROOT/projectzomboid.jar" -sourcepath tests/original_probe -d target/original-probe tests/original_probe/ServerHarness.java "tests/original_probe/$probe.java" 2>target/oracle/$name.javac \
     || { cat target/oracle/$name.javac; echo "FAIL $name (javac)"; fail=1; return; }
-  (cd "$ROOT" && java -Djava.awt.headless=true --enable-final-field-mutation=ALL-UNNAMED -Djava.library.path="$PZ_NATIVES" -Xmx4g -cp "$HERE/target/original-probe:projectzomboid.jar" "$probe" "$HERE/target/oracle/pz-oracle-$name" "$@" >"$HERE/target/oracle/$name.java.txt" 2>"$HERE/target/oracle/$name.java.err") \
+  (cd "$ROOT" && java -Djava.awt.headless=true $FFM -Djava.library.path="$PZ_NATIVES" -Xmx4g -cp "$HERE/target/original-probe:projectzomboid.jar" "$probe" "$HERE/target/oracle/pz-oracle-$name" "$@" >"$HERE/target/oracle/$name.java.txt" 2>"$HERE/target/oracle/$name.java.err") \
     || { grep -n 'ORACLE\|Exception' target/oracle/$name.java.err | tail -5; echo "FAIL $name (server probe)"; fail=1; return; }
   ./target/release/pz-dump "$name" "$ROOT" "$@" >target/oracle/$name.rust.txt 2>target/oracle/$name.rust.err \
     || { tail -5 target/oracle/$name.rust.err; echo "FAIL $name (pz-dump)"; fail=1; return; }
@@ -70,12 +163,12 @@ server_case() {
 # A probe may use another probe's code (javac finds it in tests/original_probe).
 game_case() {
   name=$1; probe=$2; shift 2
-  [ -d "$PZ_NATIVES" ] || { echo "FAIL $name: no natives in $PZ_NATIVES (set PZ_NATIVES)"; fail=1; return; }
+  [ -d "$PZ_NATIVES" ] || { echo "FAIL $name: no natives in ${PZ_NATIVES:-<none found; looked at $PZ_TRIED>} (set PZ_NATIVES)"; fail=1; return; }
   javac -nowarn -encoding UTF-8 -cp "$ROOT/projectzomboid.jar" -sourcepath tests/original_probe -d target/original-probe "tests/original_probe/$probe.java" 2>target/oracle/$name.javac \
     || { cat target/oracle/$name.javac; echo "FAIL $name (javac)"; fail=1; return; }
   scratch="$HERE/target/oracle/pz-oracle-$name"; rm -rf "$scratch"
-  (cd "$ROOT" && java -Djava.awt.headless=true --enable-final-field-mutation=ALL-UNNAMED -Djava.library.path="$PZ_NATIVES" -Xmx4g -cp "$HERE/target/original-probe:projectzomboid.jar" "$probe" "$scratch" "$@" >"$HERE/target/oracle/$name.java.txt" 2>"$HERE/target/oracle/$name.java.err") \
-    || { tail -5 target/oracle/$name.java.err; echo "FAIL $name (game probe)"; fail=1; return; }
+  (cd "$ROOT" && java -Djava.awt.headless=true $FFM -Djava.library.path="$PZ_NATIVES" -Xmx4g -cp "$HERE/target/original-probe:projectzomboid.jar" "$probe" "$scratch" "$@" >"$HERE/target/oracle/$name.java.txt" 2>"$HERE/target/oracle/$name.java.err") \
+    || { head -30 target/oracle/$name.java.err; echo "FAIL $name (game probe)"; fail=1; return; }
   ./target/release/pz-dump "$name" "$ROOT" "$scratch" "$@" >target/oracle/$name.rust.txt 2>target/oracle/$name.rust.err \
     || { tail -5 target/oracle/$name.rust.err; echo "FAIL $name (pz-dump)"; fail=1; return; }
   if cmp -s target/oracle/$name.java.txt target/oracle/$name.rust.txt; then
@@ -91,18 +184,17 @@ game_measure() {
   javac -nowarn -encoding UTF-8 -cp "$ROOT/projectzomboid.jar" -d target/original-probe "tests/original_probe/$probe.java" 2>target/oracle/$name.javac \
     || { cat target/oracle/$name.javac; echo "FAIL $name (javac)"; fail=1; return; }
   scratch="$HERE/target/oracle/pz-oracle-$name"; rm -rf "$scratch"
-  (cd "$ROOT" && java -Djava.awt.headless=true --enable-final-field-mutation=ALL-UNNAMED -Djava.library.path="$PZ_NATIVES" -Xmx4g -cp "$HERE/target/original-probe:projectzomboid.jar" "$probe" "$scratch" "$@" >"$HERE/target/oracle/$name.txt" 2>"$HERE/target/oracle/$name.err") \
-    || { tail -5 target/oracle/$name.err; echo "FAIL $name (game probe)"; fail=1; return; }
+  (cd "$ROOT" && java -Djava.awt.headless=true $FFM -Djava.library.path="$PZ_NATIVES" -Xmx4g -cp "$HERE/target/original-probe:projectzomboid.jar" "$probe" "$scratch" "$@" >"$HERE/target/oracle/$name.txt" 2>"$HERE/target/oracle/$name.err") \
+    || { head -30 target/oracle/$name.err; echo "FAIL $name (game probe)"; fail=1; return; }
   echo "MEASURED $name: target/oracle/$name.txt ($(wc -l <target/oracle/$name.txt | tr -d ' ') lines)"
 }
 # ai_case <name> <ProbeClass> [args...]: the probe calls the game's NATIVE assimp (libjassimp through jassimp.Jassimp). The
 # x86-64 slice of the library is the reference (the arm64 slice contracts multiply-add and differs in the last bit of
 # some rotation keys): on an arm64 Mac the x86-64 JRE of the game bundle runs the probe under Rosetta (PZ_JRE_X86).
-PZ_JRE_X86=${PZ_JRE_X86:-"$HOME/Library/Application Support/Steam/steamapps/common/ProjectZomboid/Project Zomboid.app/Contents/PlugIns/jre-x86_64/Contents/Home/bin/java"}
 ai_case() {
   name=$1; probe=$2; shift 2
-  [ -d "$PZ_NATIVES" ] || { echo "FAIL $name: no natives in $PZ_NATIVES (set PZ_NATIVES)"; fail=1; return; }
-  [ -x "$PZ_JRE_X86" ] || { echo "FAIL $name: no x86-64 JRE at $PZ_JRE_X86 (set PZ_JRE_X86)"; fail=1; return; }
+  [ -d "$PZ_NATIVES" ] || { echo "FAIL $name: no natives in ${PZ_NATIVES:-<none found; looked at $PZ_TRIED>} (set PZ_NATIVES)"; fail=1; return; }
+  [ -x "$PZ_JRE_X86" ] || { echo "FAIL $name: no x86-64 JRE at ${PZ_JRE_X86:-<none found>} (set PZ_JRE_X86)"; fail=1; return; }
   javac -nowarn --release 25 -encoding UTF-8 -cp "$ROOT/projectzomboid.jar" -sourcepath tests/original_probe -d target/original-probe-jre "tests/original_probe/$probe.java" 2>target/oracle/$name.javac \
     || { cat target/oracle/$name.javac; echo "FAIL $name (javac)"; fail=1; return; }
   if [ "$(uname -m)" = arm64 ]; then run_x86() { arch -x86_64 "$PZ_JRE_X86" "$@"; }; else run_x86() { "$PZ_JRE_X86" "$@"; }; fi
@@ -298,6 +390,10 @@ sel translator && game_case translator TranslatorProbe "$HERE/tests/translator_c
 sel fdlibm && jre_case fdlibm FdLibmProbe
 # zombie.iso.weather.SimplexNoise 3D + zombie.iso.worldgen.WorldGenSimplexGenerator: seeds, offsets and selector
 sel wgsimplex && run_case wgsimplex WorldGenSimplexProbe
+# zombie.iso.worldgen.WorldGenReader + biomes: the registry the game's own Lua defines (loadBiomes' parent
+# merge, the selections, priorities) and BiomeRegistry's picks over the stage-1 simplex, both Lua states
+# loaded by LoadDirBase of shared and server
+sel wgbiomes && game_case wgbiomes WorldGenBiomesProbe
 sel luaload && game_case luaload LuaLoadEnvProbe shared
 sel luaserver && game_case luaserver LuaLoadEnvProbe shared server
 sel luaclient && game_case luaclient LuaLoadEnvProbe shared client
@@ -316,7 +412,7 @@ sel stairs && server_case stairs StairsProbe 126 181
 mover_case() {
   args="8118.5 11615.5 0 -0.1 45 8077.5 11612.5 -0.1 0 45"
   javac -nowarn -encoding UTF-8 -cp "$ROOT/projectzomboid.jar" -d target/original-probe tests/original_probe/ServerHarness.java tests/original_probe/MoverProbe.java 2>target/oracle/mover.javac || { echo "FAIL mover (javac)"; fail=1; return; }
-  (cd "$ROOT" && java -Djava.awt.headless=true --enable-final-field-mutation=ALL-UNNAMED -Djava.library.path="$PZ_NATIVES" -Xmx4g -cp "$HERE/target/original-probe:projectzomboid.jar" MoverProbe "$HERE/target/oracle/pz-oracle-mover" 126 181 $args >"$HERE/target/oracle/mover.java.txt" 2>"$HERE/target/oracle/mover.java.err") || { echo "FAIL mover (server probe)"; fail=1; return; }
+  (cd "$ROOT" && java -Djava.awt.headless=true $FFM -Djava.library.path="$PZ_NATIVES" -Xmx4g -cp "$HERE/target/original-probe:projectzomboid.jar" MoverProbe "$HERE/target/oracle/pz-oracle-mover" 126 181 $args >"$HERE/target/oracle/mover.java.txt" 2>"$HERE/target/oracle/mover.java.err") || { echo "FAIL mover (server probe)"; fail=1; return; }
   cargo run -q --release -p zomboid-scene --example mover_walk -- "$ROOT" 31 45 $args >target/oracle/mover.rust.txt 2>target/oracle/mover.rust.err || { echo "FAIL mover (rust)"; fail=1; return; }
   if cmp -s target/oracle/mover.java.txt target/oracle/mover.rust.txt; then
     cp target/oracle/mover.java.txt tests/golden/mover_stairs.txt
@@ -330,7 +426,7 @@ sel mover && mover_case
 movercollide_case() {
   cell=$1; rc=$2; shift 2
   javac -nowarn -encoding UTF-8 -cp "$ROOT/projectzomboid.jar" -d target/original-probe tests/original_probe/ServerHarness.java tests/original_probe/MoverCollideProbe.java 2>target/oracle/mc.javac || { echo "FAIL movercollide (javac)"; fail=1; return; }
-  (cd "$ROOT" && java -Djava.awt.headless=true --enable-final-field-mutation=ALL-UNNAMED -Djava.library.path="$PZ_NATIVES" -Xmx4g -cp "$HERE/target/original-probe:projectzomboid.jar" MoverCollideProbe "$HERE/target/oracle/pz-oracle-mc" $cell "$@" >"$HERE/target/oracle/mc.java.txt" 2>"$HERE/target/oracle/mc.java.err") || { echo "FAIL movercollide (server probe)"; fail=1; return; }
+  (cd "$ROOT" && java -Djava.awt.headless=true $FFM -Djava.library.path="$PZ_NATIVES" -Xmx4g -cp "$HERE/target/original-probe:projectzomboid.jar" MoverCollideProbe "$HERE/target/oracle/pz-oracle-mc" $cell "$@" >"$HERE/target/oracle/mc.java.txt" 2>"$HERE/target/oracle/mc.java.err") || { echo "FAIL movercollide (server probe)"; fail=1; return; }
   cargo run -q --release -p zomboid-scene --example mover_collide -- "$ROOT" $rc "$@" >target/oracle/mc.rust.txt 2>target/oracle/mc.rust.err || { echo "FAIL movercollide (rust)"; fail=1; return; }
   if cmp -s target/oracle/mc.java.txt target/oracle/mc.rust.txt; then
     cp target/oracle/mc.java.txt "tests/golden/mover_collide_$(echo $rc | tr ' ' '_').txt"

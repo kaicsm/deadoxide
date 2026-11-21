@@ -959,6 +959,17 @@ fn wgsimplex_matches_original() {
 }
 
 #[test]
+fn wgbiomes_matches_original() {
+    // the biome registry the game's own Lua defines (shared + server), both biome tables with every field,
+    // the six selections, the priorities, and BiomeRegistry's picks over the stage-1 simplex; a fresh
+    // scratch cache dir, as loot's
+    let scratch = std::env::temp_dir().join("pz-oracle-hashes-wgbiomes");
+    let _ = std::fs::remove_dir_all(&scratch);
+    check("wgbiomes", &[scratch.to_str().expect("utf-8 path")]);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
 fn luaos_matches_original() {
     let cases = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/lua_os_cases.txt");
     check("luaos", &[cases.to_str().expect("utf-8 path")]);
