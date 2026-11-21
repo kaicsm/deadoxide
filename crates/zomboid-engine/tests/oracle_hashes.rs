@@ -954,6 +954,11 @@ fn fdlibm_matches_original() {
 }
 
 #[test]
+fn wgsimplex_matches_original() {
+    check("wgsimplex", &[]);
+}
+
+#[test]
 fn luaos_matches_original() {
     let cases = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/lua_os_cases.txt");
     check("luaos", &[cases.to_str().expect("utf-8 path")]);

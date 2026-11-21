@@ -135,6 +135,7 @@ fn main() {
         Some("luaos") if a.len() == 4 => luavm(Path::new(&a[2]), Path::new(&a[3])),
         Some("javachars") if a.len() == 3 => javachars(),
         Some("fdlibm") if a.len() == 3 => fdlibm(),
+        Some("wgsimplex") if a.len() == 3 => wgsimplex(),
         Some("luaload" | "luaserver" | "luaclient") if a.len() >= 4 => {
             luaload(Path::new(&a[2]), &a[3], &a[4..], false)
         }
@@ -11964,6 +11965,65 @@ pub fn javachars() -> Result<String, String> {
             | (u8::from(is_upper_case(c)) << 2);
         if f != 0 {
             let _ = writeln!(out, "{c:x} {f}");
+        }
+    }
+    Ok(out)
+}
+
+/// `tests/original_probe/WorldGenSimplexProbe.java` on the port: the 3D SimplexNoise over a 16x16x16 grid, then
+/// WorldGenSimplexGenerator noise/selector for six seeds over an 8x8 grid, doubles in Double.toString form.
+pub fn wgsimplex() -> Result<String, String> {
+    use std::fmt::Write as _;
+    use zomboid_engine::java;
+    use zomboid_engine::zombie::iso::weather::simplex_noise;
+    use zomboid_engine::zombie::iso::worldgen::world_gen_simplex_generator::WorldGenSimplexGenerator;
+    let mut out = String::new();
+    const C: [f64; 16] = [
+        -1048576.5, -300.25, -128.0, -1.75, -0.5, 0.0, 0.25, 1.0, 1.5, 63.75, 64.0, 127.999, 128.0,
+        300.0, 4096.5, 1048576.0,
+    ];
+    for x in C {
+        for y in C {
+            for z in C {
+                let n = simplex_noise::noise3(x, y, z);
+                let _ = writeln!(
+                    out,
+                    "SIMPLEX3 {},{},{}={}",
+                    java::double_to_string(x),
+                    java::double_to_string(y),
+                    java::double_to_string(z),
+                    java::double_to_string(n)
+                );
+            }
+        }
+    }
+    const SEEDS: [i64; 6] = [1, 42, -1, 2147483647, i64::MIN, 0x1234567890ABCDEF];
+    const W: [f64; 8] = [-300.25, -1.75, 0.0, 0.25, 1.0, 63.75, 128.0, 300.0];
+    for seed in SEEDS {
+        let g = WorldGenSimplexGenerator::new(seed);
+        for x in W {
+            for y in W {
+                let n = g.noise(x, y);
+                let _ = writeln!(
+                    out,
+                    "WGSG {seed},{},{} landscape={} plant={} bush={} temperature={} hygrometry={} ore={}",
+                    java::double_to_string(x),
+                    java::double_to_string(y),
+                    java::double_to_string(n.landscape),
+                    java::double_to_string(n.plant),
+                    java::double_to_string(n.bush),
+                    java::double_to_string(n.temperature),
+                    java::double_to_string(n.hygrometry),
+                    java::double_to_string(n.ore)
+                );
+                let _ = writeln!(
+                    out,
+                    "WGSEL {seed},{},{}={}",
+                    java::double_to_string(x),
+                    java::double_to_string(y),
+                    java::double_to_string(g.selector(x, y))
+                );
+            }
         }
     }
     Ok(out)

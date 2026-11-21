@@ -266,3 +266,7 @@ Added the original seeded cellular generator and bounded integer operation, vali
 ### Partial Lua fish abundance and lure selection (2026-11-12)
 
 Connected `getFishAbundance` to restored and newly added chum where no eligible natural fish point needs saved zone state. The installed FishingZones.lua and Fish.lua now run through a controlled chum-to-lure-selection scenario matching the Java original. Other positions explicitly error until fishing zone state is ported; no-fish-zone indexing reproduces the measured original behavior. See the ledger for fixtures and limitations.
+
+### World generation: simplex foundation (2026-11-21)
+
+First piece of zombie.iso.worldgen beyond WorldGenParams/WorldGenUtils: the 3D form of SimplexNoise (the climate port had the 2D form only) and WorldGenSimplexGenerator - six fields seeded from Random(seed+100..600), three nextDouble draws each (offsetX, offsetY, depth), scale 128.0, plus the selector (seed+700, scale 16.0, mapped to 0..1). Proven by the wgsimplex oracle (WorldGenSimplexProbe). WorldGenChunk, WorldGenReader, the biome registry, roads, blending and veins remain unported.

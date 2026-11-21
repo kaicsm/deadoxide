@@ -296,6 +296,8 @@ sel javachars && jre_case javachars JavaCharsProbe
 # zombie.core.Translator: Languages.init + loadFiles for every language, getText & co., the formatter and org.json
 sel translator && game_case translator TranslatorProbe "$HERE/tests/translator_cases.txt"
 sel fdlibm && jre_case fdlibm FdLibmProbe
+# zombie.iso.weather.SimplexNoise 3D + zombie.iso.worldgen.WorldGenSimplexGenerator: seeds, offsets and selector
+sel wgsimplex && run_case wgsimplex WorldGenSimplexProbe
 sel luaload && game_case luaload LuaLoadEnvProbe shared
 sel luaserver && game_case luaserver LuaLoadEnvProbe shared server
 sel luaclient && game_case luaclient LuaLoadEnvProbe shared client

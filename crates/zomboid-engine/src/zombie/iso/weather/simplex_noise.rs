@@ -103,6 +103,102 @@ pub fn noise(xin: f64, yin: f64) -> f64 {
     70.0 * (n0 + n1 + n2)
 }
 
+/// zombie.iso.weather.SimplexNoise.grad3 (x, y, z): the full table the 3D noise reads. The 2D form above reads
+/// only each gradient's x and y, which is why GRAD3 omits z.
+const GRAD3_XYZ: [(f64, f64, f64); 12] = [
+    (1.0, 1.0, 0.0),
+    (-1.0, 1.0, 0.0),
+    (1.0, -1.0, 0.0),
+    (-1.0, -1.0, 0.0),
+    (1.0, 0.0, 1.0),
+    (-1.0, 0.0, 1.0),
+    (1.0, 0.0, -1.0),
+    (-1.0, 0.0, -1.0),
+    (0.0, 1.0, 1.0),
+    (0.0, -1.0, 1.0),
+    (0.0, 1.0, -1.0),
+    (0.0, -1.0, -1.0),
+];
+
+/// zombie.iso.weather.SimplexNoise.noise(double, double, double): 3D simplex noise in about [-1, 1]; F3 and G3
+/// are the class's literals 0.3333333333333333 and 0.16666666666666666. This is the overload
+/// zombie.iso.worldgen.WorldGenSimplexGenerator.WGSimplex.noise calls.
+pub fn noise3(xin: f64, yin: f64, zin: f64) -> f64 {
+    let g3 = 0.16666666666666666;
+    let s = (xin + yin + zin) * 0.3333333333333333;
+    let i = fastfloor(xin + s);
+    let j = fastfloor(yin + s);
+    let k = fastfloor(zin + s);
+    let t = f64::from(i.wrapping_add(j).wrapping_add(k)) * g3;
+    let origin_x0 = f64::from(i) - t;
+    let origin_y0 = f64::from(j) - t;
+    let origin_z0 = f64::from(k) - t;
+    let x0 = xin - origin_x0;
+    let y0 = yin - origin_y0;
+    let z0 = zin - origin_z0;
+    let (i1, j1, k1, i2, j2, k2) = if x0 >= y0 {
+        if y0 >= z0 {
+            (1, 0, 0, 1, 1, 0)
+        } else if x0 >= z0 {
+            (1, 0, 0, 1, 0, 1)
+        } else {
+            (0, 0, 1, 1, 0, 1)
+        }
+    } else if y0 < z0 {
+        (0, 0, 1, 0, 1, 1)
+    } else if x0 < z0 {
+        (0, 1, 0, 0, 1, 1)
+    } else {
+        (0, 1, 0, 1, 1, 0)
+    };
+    let x1 = x0 - f64::from(i1) + g3;
+    let y1 = y0 - f64::from(j1) + g3;
+    let z1 = z0 - f64::from(k1) + g3;
+    let x2 = x0 - f64::from(i2) + 0.3333333333333333;
+    let y2 = y0 - f64::from(j2) + 0.3333333333333333;
+    let z2 = z0 - f64::from(k2) + 0.3333333333333333;
+    let x3 = x0 - 1.0 + 0.5;
+    let y3 = y0 - 1.0 + 0.5;
+    let z3 = z0 - 1.0 + 0.5;
+    let ii = i & 0xFF;
+    let jj = j & 0xFF;
+    let kk = k & 0xFF;
+    let gi0 = perm_mod12(ii + perm(jj + perm(kk)));
+    let gi1 = perm_mod12(ii + i1 + perm(jj + j1 + perm(kk + k1)));
+    let gi2 = perm_mod12(ii + i2 + perm(jj + j2 + perm(kk + k2)));
+    let gi3 = perm_mod12(ii + 1 + perm(jj + 1 + perm(kk + 1)));
+    let dot = |g: (f64, f64, f64), x: f64, y: f64, z: f64| g.0 * x + g.1 * y + g.2 * z;
+    let mut t0 = 0.6 - x0 * x0 - y0 * y0 - z0 * z0;
+    let n0 = if t0 < 0.0 {
+        0.0
+    } else {
+        t0 *= t0;
+        t0 * t0 * dot(GRAD3_XYZ[gi0], x0, y0, z0)
+    };
+    let mut t1 = 0.6 - x1 * x1 - y1 * y1 - z1 * z1;
+    let n1 = if t1 < 0.0 {
+        0.0
+    } else {
+        t1 *= t1;
+        t1 * t1 * dot(GRAD3_XYZ[gi1], x1, y1, z1)
+    };
+    let mut t2 = 0.6 - x2 * x2 - y2 * y2 - z2 * z2;
+    let n2 = if t2 < 0.0 {
+        0.0
+    } else {
+        t2 *= t2;
+        t2 * t2 * dot(GRAD3_XYZ[gi2], x2, y2, z2)
+    };
+    let mut t3 = 0.6 - x3 * x3 - y3 * y3 - z3 * z3;
+    let n3 = if t3 < 0.0 {
+        0.0
+    } else {
+        t3 *= t3;
+        t3 * t3 * dot(GRAD3_XYZ[gi3], x3, y3, z3)
+    };
+    32.0 * (n0 + n1 + n2 + n3)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +213,12 @@ mod tests {
         }
         assert!(seen.iter().all(|s| *s));
         assert_eq!(noise(0.0, 0.0), 0.0);
+    }
+
+    /// The 3D form is 0 on the origin lattice corner as well (every corner contribution is either cut off by
+    /// the 0.6 radius or dotted with the zero vector).
+    #[test]
+    fn lattice_zero_3d() {
+        assert_eq!(noise3(0.0, 0.0, 0.0), 0.0);
     }
 }
