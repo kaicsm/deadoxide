@@ -1,7 +1,7 @@
 //! zombie.iso.worldgen.maps.BiomeRaster: the first two channels of each map pixel.
 
-/// BiomeRaster.createFromImage / getSamples. The image loader is external to the engine: callers
-/// supply decoded RGBA data; the raster preserves exactly the two bytes the Java class extracts.
+/// BiomeRaster.createFromImage / getSamples: retain the first two components of each pixel,
+/// as ImageData.getPixelClamped does in the Java engine.
 #[derive(Clone, Debug)]
 pub struct BiomeRaster {
     pub width: i32,
@@ -10,6 +10,74 @@ pub struct BiomeRaster {
 }
 
 impl BiomeRaster {
+    /// ImageData(String) in the original Java catches native image decoding failures,
+    /// sets width and height to -1 and returns. BiomeRaster.createFromImage then
+    /// retains those dimensions rather than throwing. A later getSamples call throws
+    /// ArrayIndexOutOfBoundsException("Invalid coordinates.").
+    ///
+    /// Preserve that observable state instead of mistaking a corrupt image for
+    /// an absent image. Missing files are handled by BiomeMap before decoding.
+    pub(crate) fn invalid_image() -> Self {
+        Self { width: -1, height: -1, pixels: vec![0; 2] }
+    }
+
+    /// BiomeRaster.createFromImage(String): decode the selected image as RGBA, then preserve
+    /// the red (biome) and green (zone) bytes. PNG rows are stored top-to-bottom, just as
+    /// NativeImage.read/ImageData.getPixelClamped exposes them to the Java world generator.
+    /// Palette, transparency and sub-eight-bit samples are expanded by the PNG decoder.
+    pub fn from_png_path(path: &std::path::Path) -> Result<Self, String> {
+        use std::io::BufReader;
+
+        let file = std::fs::File::open(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut decoder = png::Decoder::new(BufReader::new(file));
+        decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+        let mut reader = decoder.read_info()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut raw = vec![0u8; reader.output_buffer_size()];
+        let frame = reader.next_frame(&mut raw)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let width = i32::try_from(frame.width).map_err(|_| "biome raster width overflow")?;
+        let height = i32::try_from(frame.height).map_err(|_| "biome raster height overflow")?;
+        if width == 0 || height == 0 {
+            return Err("invalid biome raster dimensions".to_owned());
+        }
+        let count = (width as usize).checked_mul(height as usize)
+            .ok_or("biome raster dimensions overflow")?;
+        let mut pixels = Vec::with_capacity(count.checked_mul(2)
+            .ok_or("biome raster dimensions overflow")?);
+        let buffer = &raw[..frame.buffer_size()];
+        match frame.color_type {
+            png::ColorType::Rgba => {
+                for pixel in buffer.chunks_exact(4) {
+                    pixels.extend_from_slice(&pixel[..2]);
+                }
+            }
+            png::ColorType::Rgb => {
+                for pixel in buffer.chunks_exact(3) {
+                    pixels.extend_from_slice(&pixel[..2]);
+                }
+            }
+            png::ColorType::GrayscaleAlpha => {
+                for pixel in buffer.chunks_exact(2) {
+                    pixels.extend_from_slice(&[pixel[0], pixel[0]]);
+                }
+            }
+            png::ColorType::Grayscale => {
+                for &grey in buffer {
+                    pixels.extend_from_slice(&[grey, grey]);
+                }
+            }
+            png::ColorType::Indexed => {
+                return Err("indexed PNG was not expanded".to_owned());
+            }
+        }
+        if pixels.len() != count * 2 {
+            return Err("PNG pixels do not match image dimensions".to_owned());
+        }
+        Ok(Self { width, height, pixels })
+    }
+
     /// BiomeRaster.createFromImage: copy the R and G channels of every pixel, x first within y.
     pub fn from_rgba(width: i32, height: i32, rgba: &[u8]) -> Result<Self, String> {
         let count = usize::try_from(width).ok().and_then(|w| usize::try_from(height).ok().and_then(|h| w.checked_mul(h)))

@@ -72,7 +72,7 @@ server_case() {
   javac -nowarn -encoding UTF-8 -cp "$ROOT/projectzomboid.jar" -sourcepath tests/original_probe -d target/original-probe tests/original_probe/ServerHarness.java "tests/original_probe/$probe.java" 2>target/oracle/$name.javac \
     || { cat target/oracle/$name.javac; echo "FAIL $name (javac)"; fail=1; return; }
   (cd "$ROOT" && java_with_final_field_mutation -Djava.awt.headless=true -Djava.library.path="$PZ_NATIVES" -Xmx4g -cp "$HERE/target/original-probe:projectzomboid.jar" "$probe" "$HERE/target/oracle/pz-oracle-$name" "$@" >"$HERE/target/oracle/$name.java.txt" 2>"$HERE/target/oracle/$name.java.err") \
-    || { tail -n 40 "target/oracle/$name.java.err"; echo "FAIL $name (server probe)"; fail=1; return; }
+    || { echo "FAIL $name (server probe): Java stack trace and recent logs:"; tail -n 40 "target/oracle/$name.java.err"; fail=1; return; }
   ./target/release/pz-dump "$name" "$ROOT" "$@" >target/oracle/$name.rust.txt 2>target/oracle/$name.rust.err \
     || { tail -5 target/oracle/$name.rust.err; echo "FAIL $name (pz-dump)"; fail=1; return; }
   if cmp -s target/oracle/$name.java.txt target/oracle/$name.rust.txt; then
@@ -342,6 +342,20 @@ sel wgtiles && game_case wgtiles WgTilesProbe
 # WorldGenChunk constructor/public queries against the original dedicated server's state.
 # Generated square object streams and blending are deliberately outside this oracle's scope.
 sel wgchunk && server_case wgchunk WgChunkProbe
+# BiomeMap automatic PNG loading: active-map order, band extraction, missing-entry caching,
+# cache eviction, and refusal to fall through when the first existing PNG is corrupt.
+sel wgbiomemap && server_case wgbiomemap WgBiomeMapProbe
+# WorldGenChunk.genMapChunk: a 2x2 prepopulated chunk cache, real tile definitions and Lua
+# biome entries, and a generated PNG indexed via the original game file system.
+sel wgmapchunk && server_case wgmapchunk WgMapChunkProbe
+# Blending.applyBlending: a loaded 3x3 server-map fixture; exact tree, floor and handshake stream.
+sel wgblending && server_case wgblending WgBlendingProbe
+# AttachmentsHandler: real sprite catalog, full/partial and missing-neighbour paths, floor overlays.
+sel wgattachments && server_case wgattachments WgAttachmentsProbe
+# WorldGenChunk.applyPrefab via generateChunks with a controlled 2x2 static-module schematic.
+sel wgprefabs && server_case wgprefabs WgPrefabsProbe
+# Real lotpack-backed LoadBrandNew (2x2 per request) + 3x3 loaded chunk update.
+sel wgfullworld && server_case wgfullworld WgFullWorldProbe
 # WorldGenChunk.generateChunks: a controlled empty 2x2 cache (one pre-existing object) on the
 # booted original server, compared against the port using the same Lua tables and tile definitions.
 sel wggenerate && server_case wggenerate WgGenerateProbe

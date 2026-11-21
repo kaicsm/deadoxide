@@ -146,6 +146,12 @@ fn main() {
         Some("wgroads") if a.len() == 3 => wgroads(Path::new(&a[2])),
         Some("wgtiles") if a.len() == 4 => worldgen_dump::tiles(),
         Some("wgchunk") if a.len() == 3 => worldgen_dump::chunk(Path::new(&a[2])),
+        Some("wgbiomemap") if a.len() == 3 => worldgen_dump::biomemap(Path::new(&a[2])),
+        Some("wgmapchunk") if a.len() == 3 => worldgen_dump::mapchunk(Path::new(&a[2])),
+        Some("wgblending") if a.len() == 3 => worldgen_dump::blending(Path::new(&a[2])),
+        Some("wgattachments") if a.len() == 3 => worldgen_dump::attachments(Path::new(&a[2])),
+        Some("wgprefabs") if a.len() == 3 => worldgen_dump::prefabs(Path::new(&a[2])),
+        Some("wgfullworld") if a.len() == 3 => worldgen_dump::fullworld(Path::new(&a[2])),
         Some("wggenerate") if a.len() == 3 => worldgen_dump::generate(Path::new(&a[2])),
         Some("luaload" | "luaserver" | "luaclient") if a.len() >= 4 => {
             luaload(Path::new(&a[2]), &a[3], &a[4..], false)

@@ -52,6 +52,12 @@ impl ChunksCache {
         self.chunks.get_mut(&key)
     }
 
+    /// HashMap.remove: used by the neighbour-availability differential fixtures.
+    /// The Java cache does not shrink its recorded bounds on removal.
+    pub fn remove(&mut self, key: ChunkCoord) -> Option<IsoChunk> {
+        self.chunks.remove(&key)
+    }
+
     /// ChunksCache.getMinChunkX.
     pub fn get_min_chunk_x(&self) -> i32 {
         if self.initialized { self.min_chunk_x } else { i32::MAX }

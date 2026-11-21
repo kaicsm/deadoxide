@@ -50,11 +50,15 @@ pub struct WorldGenCell {
 pub struct WorldGenChunkState {
     pub blending_done_full: bool,
     pub blending_done_partial: bool,
+    /// Java IsoChunk.blendingModified: one handshake flag per compass side.
+    pub blending_modified: [bool; 4],
     pub attachments_done_full: bool,
     pub attachments_state: [bool; 5],
     pub generated_worldgen: bool,
     pub procedural_zombie_squares: Vec<(i32, i32, i32)>,
     pub attachments_partial: Vec<(i32, i32, i32)>,
+    /// Java uses null vs an allocated, possibly empty partial list.
+    pub attachments_partial_initialized: bool,
     /// NORTH, SOUTH, WEST, EAST as in BlendDirection enum.
     pub modification_depth: [i32; 4],
 }
@@ -64,11 +68,15 @@ impl Default for WorldGenChunkState {
         Self {
             blending_done_full: false,
             blending_done_partial: false,
-            attachments_done_full: false,
-            attachments_state: [false; 5],
+            blending_modified: [false; 4],
+            // New IsoChunk initializes attachment flags to true. Only genRandomChunk
+            // and explicit resets clear them.
+            attachments_done_full: true,
+            attachments_state: [true; 5],
             generated_worldgen: false,
             procedural_zombie_squares: Vec::new(),
             attachments_partial: Vec::new(),
+            attachments_partial_initialized: false,
             // BlendDirection.NORTH/SOUTH/WEST/EAST.defaultDepth.
             modification_depth: [7, 0, 7, 0],
         }
@@ -211,6 +219,15 @@ impl WorldGenChunk {
                 if random {
                     self.gen_random_chunk(chunks, key, ctx, cell, &mut to_be_done)?;
                 } else if let Some(map) = biome_map {
+                    // IsoChunk constructor defaults: map chunks are already populated and
+                    // their attachment flags begin true. genRandomChunk explicitly resets
+                    // them to false, but genMapChunk does not. Keep those two paths distinct.
+                    self.chunk_states.entry((wx, wy)).or_insert_with(|| {
+                        let mut state = WorldGenChunkState::default();
+                        state.attachments_done_full = true;
+                        state.attachments_state = [true; 5];
+                        state
+                    });
                     self.gen_map_chunk(chunks, key, ctx, cell, map, zones, &mut to_be_done)?;
                     self.clean_chunk(chunks, key, "Sand", "vegetation_groundcover_01", ctx.sprites, ctx.alias);
                     self.clean_chunk(chunks, key, "Road_*", "vegetation_groundcover_01", ctx.sprites, ctx.alias);
@@ -531,6 +548,10 @@ impl WorldGenChunk {
         let biome_filter = lookup.biome.as_deref();
         let ore_filter = lookup.ore.as_deref();
         if biome_filter == Some("$random") {
+            // Java resets attachment flags before discarding this mapped square.
+            let state = self.chunk_states.entry((key.x, key.y)).or_default();
+            state.attachments_done_full = false;
+            state.attachments_state = [false; 5];
             // The original discards the square and starts genRandomSquare with an empty road set.
             chunks.get_mut(key).ok_or("missing chunk")?.set_square(lx, ly, 0, Some(IsoGridSquare::new(x, y, 0)));
             self.gen_random_square(chunks, key, x, y, &[], done, ctx, cell)?;
@@ -671,13 +692,39 @@ impl WorldGenChunk {
                             let sq = chunks.get_mut(key).and_then(|c| c.get_grid_square_mut(lx, ly, 0)).ok_or("missing square")?;
                             sq.objects.remove(i);
                             self.tile.apply_tile(tile, sq, ctx)?;
-                            self.chunk_states.entry((key.x, key.y)).or_default().attachments_partial.push((x, y, 0));
+                            let state = self.chunk_states.entry((key.x, key.y)).or_default();
+                            state.attachments_done_full = false;
+                            state.attachments_state = [false; 5];
+                            state.attachments_partial_initialized = true;
+                            state.attachments_partial.push((x, y, 0));
                         }
                     }
                 }
             }
             // The original increments i even if the current entry was removed.
             i += 1;
+        }
+        Ok(())
+    }
+
+    /// `IsoChunk.update`'s WorldGen post-processing portion: blending directional
+    /// handshakes run first, then floor attachments if the nine chunks exist.
+    /// Call on loaded chunks as neighbouring chunks become available; it is safe
+    /// to call repeatedly because the Java flags make both stages idempotent.
+    pub fn update_worldgen_chunk(
+        &mut self, chunks: &mut ChunksCache, key: ChunkCoord,
+        blending: &super::blending::Blending,
+        attachments: &super::attachments::AttachmentsHandler,
+        sprites: &mut IsoSpriteManager,
+        alias: &crate::zombie::core::tile_property_alias_map::TilePropertyAliasMap,
+    ) -> Result<(), String> {
+        if !chunks.contains(key) { return Err("missing worldgen update chunk".into()); }
+        let state = self.chunk_states.entry((key.x, key.y)).or_default();
+        if !state.blending_done_full && !state.blending_modified.iter().all(|modified| *modified) {
+            blending.apply_blending(self, chunks, key, sprites, alias)?;
+        }
+        if !self.chunk_states.get(&(key.x, key.y)).is_some_and(|s| s.attachments_done_full) {
+            attachments.apply_attachments(self, chunks, key, sprites, alias)?;
         }
         Ok(())
     }

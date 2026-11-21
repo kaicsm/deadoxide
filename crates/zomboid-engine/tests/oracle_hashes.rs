@@ -142,6 +142,31 @@ fn profile_save() -> Option<String> {
 }
 
 #[test]
+fn wgbiomemap_matches_original() {
+    check("wgbiomemap", &[]);
+}
+
+#[test]
+fn wgmapchunk_matches_original() {
+    check("wgmapchunk", &[]);
+}
+
+#[test]
+fn wgblending_matches_original() {
+    check("wgblending", &[]);
+}
+
+#[test]
+fn wgattachments_matches_original() {
+    check("wgattachments", &[]);
+}
+
+#[test]
+fn wgprefabs_matches_original() {
+    check("wgprefabs", &[]);
+}
+
+#[test]
 fn world_dictionary_matches_original() {
     let Some(save) = profile_save() else {
         eprintln!("SKIPPED worlddictionary: the isolated profile's save is not present");
@@ -1062,4 +1087,9 @@ fn world_gen_generated_chunks_match_original_when_measured() {
     // Uses real tile definitions and the same 2x2 fixture as WgGenerateProbe.java.
     // This is activated only after both sides compare byte-for-byte in tools/oracle.sh.
     check_worldgen_when_measured("wggenerate", &[]);
+}
+
+#[test]
+fn wgfullworld_matches_original_when_measured() {
+    check_worldgen_when_measured("wgfullworld", &[]);
 }

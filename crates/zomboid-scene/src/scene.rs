@@ -26,6 +26,8 @@ use zomboid_engine::zombie::iso::sprite::iso_sprite_manager::SpriteRef;
 use zomboid_engine::zombie::iso::sprite_details::iso_flag_type::IsoFlagType;
 use zomboid_engine::zombie::iso::sprite_details::iso_object_type::IsoObjectType;
 use zomboid_engine::zombie::iso::worldgen::world_gen_params::WorldGenParams;
+use zomboid_engine::zombie::iso::worldgen::world_gen_chunk::WorldGenCell;
+use zomboid_engine::zombie::iso::worldgen::runtime::WorldGenRuntime;
 use zomboid_engine::zombie::radio::media::recorded_media::RecordedMedia;
 use zomboid_engine::zombie::sandbox_options::SandboxOptions;
 use zomboid_engine::zombie::scripting::script_manager::ScriptManager;
@@ -217,8 +219,9 @@ impl SaveFiles {
 }
 
 /// Like `load_region`, but as the game opens a save: chunks that the save's `map/<wx>/<wy>.bin` holds are read from it
-/// (zombie.iso.IsoChunk.LoadOrCreate → LoadFromDisk), the others are created from the map (`LoadBrandNew`, without
-/// world generation); a chunk whose file fails to load is created from the map as `LoadChunk` does after `Blam`. The
+/// (zombie.iso.IsoChunk.LoadOrCreate → LoadFromDisk), the others run the 2x2
+/// WorldGen `LoadBrandNew` pipeline on desktop. A chunk whose file fails to load
+/// is regenerated from its map group as `LoadChunk` does after `Blam`. The
 /// world seed for basements is the save's (`map_worldgen.bin`).
 pub fn load_region_from_save(
     root: &Path,
@@ -265,6 +268,22 @@ pub fn load_region_from_save(
     for l in &world.log {
         log::warn!("{l}");
     }
+    // IsoChunk.LoadBrandNew: initialise WorldGen once per world, not once per chunk.
+    // The browser's VFS currently cannot supply BiomeMap's file-backed PNG loader.
+    let mut worldgen = if cfg!(target_arch = "wasm32") {
+        None
+    } else {
+        let mut params = WorldGenParams::default();
+        params.seed = world_seed as i32;
+        let bounds = (
+            world.meta_grid.min_x, world.meta_grid.max_x,
+            world.meta_grid.min_y, world.meta_grid.max_y,
+        );
+        Some(WorldGenRuntime::from_game(
+            root, "Muldraugh, KY", params, &sandbox, bounds,
+            &world.sprites, &world.alias,
+        ).map_err(|e| anyhow!("initialising WorldGen: {e}"))?)
+    };
     let IsoWorld {
         sprites,
         alias,
@@ -319,27 +338,39 @@ pub fn load_region_from_save(
                             }
                         }
                     });
-                    let ch = match from_save {
+                    let mut ch = match from_save {
                         Some(ch) => {
                             loaded_from_save += 1;
+                            if let Some(runtime) = worldgen.as_mut() {
+                                runtime.register_saved_chunk(&ch);
+                            }
                             ch
                         }
                         None => {
-                            let mut ch = IsoChunk::new(wx, wy);
                             let mut errors = Vec::new();
-                            cell_loader::load_cell_binary_chunk(
-                                &mut ctx,
-                                wx,
-                                wy,
-                                &mut ch,
-                                &mut errors,
-                            );
+                            let ch = match worldgen.as_mut() {
+                                Some(runtime) => runtime.load_brand_new(
+                                    wx, wy, &mut ctx,
+                                    WorldGenCell { world_x: 0, world_y: 0 },
+                                    &mut [], &mut errors,
+                                ).map_err(|e| anyhow!("WorldGen at {wx},{wy}: {e}"))?,
+                                None => {
+                                    let mut ch = IsoChunk::new(wx, wy);
+                                    cell_loader::load_cell_binary_chunk(
+                                        &mut ctx, wx, wy, &mut ch, &mut errors,
+                                    );
+                                    ch
+                                }
+                            };
                             for e in errors {
                                 log::warn!("chunk {wx},{wy}: {e}");
                             }
                             ch
                         }
                     };
+                    // ServerMap.ServerCell.RecalcAll2: the post-processors require loaded
+                    // neighbours, and freshly created squares inherit this state.
+                    ch.set_loaded();
                     zmin = zmin.min(ch.get_min_level());
                     zmax = zmax.max(ch.get_max_level());
                     chunks.push(ch);
@@ -352,6 +383,12 @@ pub fn load_region_from_save(
     }
     let missing = ctx.missing_tiles.len() as u64;
     drop(ctx);
+    // IsoChunk.update: after all neighbours in this region have been loaded, run
+    // blending handshakes followed by floor attachments on actual scene chunks.
+    if let Some(runtime) = worldgen.as_mut() {
+        runtime.postprocess_loaded(&mut chunks, &mut world.sprites, &world.alias)
+            .map_err(|e| anyhow!("WorldGen post-processing: {e}"))?;
+    }
     if save.is_some() {
         log::info!(
             "{loaded_from_save} of {} chunks loaded from the save",
@@ -419,6 +456,7 @@ pub fn load_region_from_save(
         levels: (zmin, zmax),
         missing,
         loaded_from_save,
+        worldgen,
     };
     let mut scene = Scene {
         atlas,
@@ -445,6 +483,8 @@ pub struct SceneState {
     missing: u64,
     /// Chunks read from the save's `map/*.bin` (the rest were created from the map).
     pub loaded_from_save: usize,
+    /// Retained to keep chunk generation and neighbour-handshake state across loads.
+    pub worldgen: Option<WorldGenRuntime>,
 }
 
 impl SceneState {

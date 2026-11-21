@@ -7480,6 +7480,7 @@ dependencies = [
 name = "zomboid-engine"
 version = "0.1.0"
 dependencies = [
+ "png 0.17.16",
  "roxmltree 0.21.2",
  "rusqlite",
  "sha2",

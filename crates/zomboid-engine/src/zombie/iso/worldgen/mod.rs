@@ -1,11 +1,14 @@
 //! Package `zombie.iso.worldgen`: the procedural world generation (B42): the Lua configuration readers,
 //! the biome registry inputs, the utilities and the generators that build on them.
+pub mod attachments;
+pub mod blending;
 pub mod biomes;
 pub mod chunks_cache;
 pub mod enums;
 pub mod maps;
 pub mod prefab_structure;
 pub mod roads;
+pub mod runtime;
 pub mod static_module;
 pub mod utils;
 pub mod veins;
